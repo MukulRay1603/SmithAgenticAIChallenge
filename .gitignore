@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Generated artifacts (large binary files)
+artifacts/xgb_spoilage.joblib
+
+# Runtime audit logs (generated on each run)
+audit_logs/compliance_events.jsonl
+
+# Dashboard
+dashboard/node_modules/
+dashboard/dist/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment variables
+.env
+.env.local
