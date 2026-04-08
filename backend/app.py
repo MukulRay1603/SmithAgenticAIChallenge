@@ -29,6 +29,8 @@ from backend.models import (
 from tools.approval_workflow import _PENDING_APPROVALS, decide as approve_decide, get_pending
 from tools import TOOL_MAP
 from orchestrator.graph import run_orchestrator, get_graph_mermaid
+from src.context_assembler import build_window_context
+from src.data_loader import load_product_profiles
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +48,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── In-memory cache of scored data ───────────────────────────────────
+# ── In-memory caches ─────────────────────────────────────────────────
 
 _df: Optional[pd.DataFrame] = None
+_profiles: Optional[dict] = None
 
 
 def _get_df() -> pd.DataFrame:
@@ -58,6 +61,13 @@ def _get_df() -> pd.DataFrame:
             raise HTTPException(503, "Run `python pipeline.py train` first")
         _df = pd.read_csv(SCORED_CSV)
     return _df
+
+
+def _get_profiles() -> dict:
+    global _profiles
+    if _profiles is None:
+        _profiles = load_product_profiles()
+    return _profiles
 
 
 # ── WebSocket connections ────────────────────────────────────────────
@@ -155,32 +165,49 @@ def get_window(window_id: str):
 
 @app.get("/api/risk/score-window/{window_id}")
 def score_window(window_id: str):
-    """Return the risk engine output for a single window in the format
-    expected by the orchestrator (system_prompt.md input contract)."""
+    """
+    Return the enriched risk engine output for a single window in the format
+    expected by the orchestrator (system_prompt.md input contract).
+
+    Extends the base risk fields with cascade context:
+      delay_ratio, delay_class, hours_to_breach, facility, product_cost,
+      window_end (for ETA computation in the cascade).
+    """
     df = _get_df()
-    row = df[df["window_id"] == window_id]
-    if row.empty:
+    profiles = _get_profiles()
+
+    try:
+        ctx = build_window_context(window_id, df, profiles)
+    except KeyError:
         raise HTTPException(404, f"Window {window_id} not found")
-    r = row.iloc[0]
-    rules = r.get("det_rules_fired", "")
-    rules_list = rules.split(";") if isinstance(rules, str) and rules else []
-    actions = r.get("recommended_actions", "")
-    actions_list = actions.split(";") if isinstance(actions, str) and actions else []
 
     return {
-        "shipment_id": r["shipment_id"],
-        "container_id": r["container_id"],
-        "window_id": r["window_id"],
-        "leg_id": r["leg_id"],
-        "product_type": r["product_id"],
-        "transit_phase": r["transit_phase"],
-        "risk_tier": r["risk_tier"],
-        "fused_risk_score": round(float(r["final_score"]), 4),
-        "ml_spoilage_probability": round(float(r["ml_score"]), 4),
-        "deterministic_rule_flags": rules_list,
+        # Core identity
+        "shipment_id": ctx["shipment_id"],
+        "container_id": ctx["container_id"],
+        "window_id": ctx["window_id"],
+        "leg_id": ctx["leg_id"],
+        "product_type": ctx["product_id"],
+        "transit_phase": ctx["transit_phase"],
+        "window_end": ctx["window_end"],
+
+        # Risk scores
+        "risk_tier": ctx["risk_tier"],
+        "fused_risk_score": ctx["final_score"],
+        "ml_spoilage_probability": ctx["ml_score"],
+        "deterministic_rule_flags": ctx["det_rules_fired"],
         "key_drivers": [],
-        "recommended_actions_from_risk_engine": actions_list,
-        "confidence_score": round(1.0 - abs(float(r["det_score"]) - float(r["ml_score"])), 4),
+        "recommended_actions_from_risk_engine": ctx["recommended_actions"],
+        "confidence_score": round(1.0 - abs(ctx["det_score"] - ctx["ml_score"]), 4),
+
+        # Cascade context fields
+        "delay_ratio": ctx["delay_ratio"],
+        "delay_class": ctx["delay_class"],
+        "hours_to_breach": ctx["hours_to_breach"],
+        "current_delay_min": ctx["current_delay_min"],
+        "facility": ctx["facility"],
+        "product_cost": ctx["product_cost"],
+
         "operational_constraints": [],
         "available_tools": list(TOOL_MAP.keys()),
     }

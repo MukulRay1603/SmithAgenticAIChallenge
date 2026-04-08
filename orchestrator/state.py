@@ -51,6 +51,9 @@ class OrchestratorState(TypedDict, total=False):
     approval_reason: str
     approval_id: Optional[str]
 
+    # ── Cascade ──
+    cascade_context: Dict[str, Any]   # keyed by tool_name; accumulates results during execute
+
     # ── Output ──
     decision_summary: str
     audit_log_summary: str

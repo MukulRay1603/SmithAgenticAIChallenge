@@ -8,8 +8,8 @@ The deterministic logic follows the rules in system_prompt.md exactly.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from typing import Any, Dict, List
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
 from orchestrator.state import OrchestratorState, PlanStep, ToolResult
 from tools import TOOL_MAP
@@ -73,27 +73,45 @@ def _identify_primary_issue(rules: list, score: float, ml_prob: float) -> str:
 TIER_PLAN_TEMPLATES: Dict[str, List[Dict[str, str]]] = {
     "CRITICAL": [
         {"action": "Log compliance event for critical risk detection",
-         "tool": "compliance_agent", "reason": "GDP/FDA requires immediate logging of critical excursions"},
-        {"action": "Notify operations team and downstream stakeholders",
-         "tool": "notification_agent", "reason": "Critical risk requires immediate stakeholder awareness"},
-        {"action": "Evaluate reroute or backup cold-storage options",
-         "tool": "cold_storage_agent", "reason": "Product integrity at risk; need temperature recovery"},
-        {"action": "Submit plan for human approval before execution",
-         "tool": "approval_workflow", "reason": "Critical actions are irreversible and require operator sign-off"},
+         "tool": "compliance_agent",
+         "reason": "GDP/FDA requires immediate logging of critical excursions"},
+        {"action": "Notify operations team and downstream stakeholders with revised ETA and spoilage probability",
+         "tool": "notification_agent",
+         "reason": "Critical risk requires immediate stakeholder awareness; alert includes facility and ETA"},
+        {"action": "Identify backup cold-storage facility for temperature recovery",
+         "tool": "cold_storage_agent",
+         "reason": "Product integrity at risk; result feeds into notification and scheduling steps"},
+        {"action": "Generate hospital reschedule recommendations based on revised ETA",
+         "tool": "scheduling_agent",
+         "reason": "Downstream appointments must be rescheduled; uses facility and ETA from cascade"},
+        {"action": "Prepare insurance claim documentation with full leg excursion history",
+         "tool": "insurance_agent",
+         "reason": "Excursion at CRITICAL tier warrants claim preparation; loss computed from ML probability"},
+        {"action": "Submit consolidated plan for human approval",
+         "tool": "approval_workflow",
+         "reason": "Critical actions are irreversible; approval queued after all prep steps are complete"},
     ],
     "HIGH": [
         {"action": "Log compliance event for high-risk detection",
-         "tool": "compliance_agent", "reason": "Audit trail for elevated risk events"},
-        {"action": "Send pre-alert to operations team",
-         "tool": "notification_agent", "reason": "Ops team needs to prepare intervention options"},
+         "tool": "compliance_agent",
+         "reason": "Audit trail for elevated risk events"},
+        {"action": "Send pre-alert to operations team with revised ETA",
+         "tool": "notification_agent",
+         "reason": "Ops team needs to prepare intervention; alert enriched with delay and facility context"},
+        {"action": "Generate reschedule recommendations for affected facilities",
+         "tool": "scheduling_agent",
+         "reason": "HIGH risk warrants scheduling prep; revised ETA injected from delay computation"},
         {"action": "Request human approval for recommended mitigation",
-         "tool": "approval_workflow", "reason": "High-risk actions need operator confirmation"},
+         "tool": "approval_workflow",
+         "reason": "HIGH-risk actions need operator confirmation before execution"},
     ],
     "MEDIUM": [
         {"action": "Log monitoring event",
-         "tool": "compliance_agent", "reason": "Traceability for elevated monitoring state"},
+         "tool": "compliance_agent",
+         "reason": "Traceability for elevated monitoring state"},
         {"action": "Send soft notification to ops dashboard",
-         "tool": "notification_agent", "reason": "Situational awareness without escalation"},
+         "tool": "notification_agent",
+         "reason": "Situational awareness without escalation"},
     ],
     "LOW": [],
 }
@@ -116,22 +134,14 @@ def plan(state: OrchestratorState) -> dict:
             reason=tmpl["reason"],
         ))
 
-    if tier == "CRITICAL" and "excursion_duration" in ri.get("deterministic_rule_flags", []):
-        draft.append(PlanStep(
-            step=len(draft) + 1,
-            action="Prepare insurance claim documentation",
-            tool="insurance_agent",
-            tool_input=_build_tool_input("insurance_agent", ri, state),
-            reason="Excursion duration exceeded; potential product loss requires claim preparation",
-        ))
-
+    # For HIGH/CRITICAL at air_handoff or customs_clearance, rerouting may recover ETA
     if tier in ("CRITICAL", "HIGH") and ri.get("transit_phase") in ("air_handoff", "customs_clearance"):
         draft.append(PlanStep(
             step=len(draft) + 1,
             action="Evaluate alternative routing options",
             tool="route_agent",
             tool_input=_build_tool_input("route_agent", ri, state),
-            reason=f"Shipment at {ri.get('transit_phase')} with high risk; rerouting may recover ETA",
+            reason=f"Shipment at {ri.get('transit_phase')} with {tier} risk; rerouting may recover ETA",
         ))
 
     logger.info("PLAN  %d steps for tier=%s", len(draft), tier)
@@ -144,11 +154,27 @@ def plan(state: OrchestratorState) -> dict:
 
 
 def _build_tool_input(tool_name: str, ri: dict, state: dict) -> dict:
-    """Construct the tool-specific input payload from risk data."""
+    """
+    Construct the baseline tool input payload from risk data.
+    These inputs are later enriched by _enrich_tool_input() during execute()
+    using results accumulated from prior tools in the cascade.
+    """
     base = {
         "shipment_id": ri.get("shipment_id", ""),
         "container_id": ri.get("container_id", ""),
     }
+
+    # Contextual fields available from enriched risk_input (set by backend score_window)
+    delay_class = ri.get("delay_class", "")
+    hours_to_breach = ri.get("hours_to_breach")
+    facility = ri.get("facility", {})
+    product_cost = ri.get("product_cost", {})
+
+    # Build a human-readable context suffix for reasons/messages
+    htb_str = f" ~{hours_to_breach:.1f}h to breach." if hours_to_breach is not None else ""
+    delay_str = f" Delay: {delay_class}." if delay_class else ""
+    context_suffix = htb_str + delay_str
+
     if tool_name == "compliance_agent":
         return {
             **base,
@@ -160,63 +186,87 @@ def _build_tool_input(tool_name: str, ri: dict, state: dict) -> dict:
                 "ml_prob": ri.get("ml_spoilage_probability"),
                 "rules": ri.get("deterministic_rule_flags", []),
                 "primary_issue": state.get("primary_issue", ""),
+                "delay_class": delay_class,
+                "hours_to_breach": hours_to_breach,
             },
             "regulatory_tags": ["GDP", "FDA_21CFR11"],
         }
+
     if tool_name == "notification_agent":
         tier = ri.get("risk_tier", "LOW")
         recipients = ["ops_team"]
         if tier == "CRITICAL":
             recipients.extend(["management", "clinic"])
+        elif tier == "HIGH":
+            recipients.append("management")
+        facility_name = facility.get("name", "")
         return {
             **base,
             "risk_tier": tier,
             "recipients": recipients,
             "message": (
-                f"[{tier}] Shipment {ri.get('shipment_id')} container {ri.get('container_id')}: "
-                f"{state.get('primary_issue', 'Risk detected')}. "
-                f"Score={ri.get('fused_risk_score', 0):.3f}, "
-                f"Phase={ri.get('transit_phase', 'unknown')}."
+                f"[{tier}] Shipment {ri.get('shipment_id')} / {ri.get('container_id')}: "
+                f"{state.get('primary_issue', 'Risk detected')}."
+                f" Score={ri.get('fused_risk_score', 0):.3f},"
+                f" Phase={ri.get('transit_phase', 'unknown')}."
+                f"{context_suffix}"
             ),
             "channel": "dashboard",
+            # spoilage_probability and facility_name enriched at execute time
+            "spoilage_probability": ri.get("ml_spoilage_probability", 0.0),
+            "facility_name": facility_name,
         }
+
     if tool_name == "cold_storage_agent":
         return {
             **base,
             "product_id": ri.get("product_type", ""),
             "urgency": "critical" if ri.get("risk_tier") == "CRITICAL" else "high",
         }
+
     if tool_name == "route_agent":
         return {
             **base,
             "current_leg_id": ri.get("leg_id", ""),
-            "reason": state.get("primary_issue", "Risk detected"),
+            "reason": state.get("primary_issue", "Risk detected") + context_suffix,
         }
+
     if tool_name == "insurance_agent":
         return {
             **base,
             "product_id": ri.get("product_type", ""),
             "risk_tier": ri.get("risk_tier", ""),
-            "incident_summary": state.get("primary_issue", ""),
+            "leg_id": ri.get("leg_id", ""),
+            "spoilage_probability": ri.get("ml_spoilage_probability", 0.0),
+            "incident_summary": state.get("primary_issue", "") + context_suffix,
         }
+
     if tool_name == "scheduling_agent":
+        facility_name = facility.get("name", "")
+        facility_loc = facility.get("location", "")
+        resolved = f"{facility_name} ({facility_loc})" if facility_name else "facility_TBD"
         return {
             **base,
             "product_id": ri.get("product_type", ""),
-            "affected_facilities": ["facility_TBD"],
-            "original_eta": "TBD",
-            "reason": state.get("primary_issue", ""),
+            "affected_facilities": [resolved],
+            "original_eta": str(ri.get("window_end", "TBD")),
+            "reason": state.get("primary_issue", "") + context_suffix,
         }
+
     if tool_name == "approval_workflow":
-        active = state.get("draft_plan") or state.get("revised_plan") or []
+        active = state.get("revised_plan") or state.get("draft_plan") or []
         return {
             "shipment_id": ri.get("shipment_id", ""),
-            "action_description": f"Execute mitigation plan ({len(active)} steps) for {ri.get('risk_tier')} risk",
+            "action_description": (
+                f"Execute {len(active)}-step mitigation plan for "
+                f"{ri.get('risk_tier')} risk.{context_suffix}"
+            ),
             "risk_tier": ri.get("risk_tier", "LOW"),
             "urgency": state.get("urgency", "high"),
             "proposed_actions": [s.get("action", "") for s in active if isinstance(s, dict)],
-            "justification": state.get("primary_issue", ""),
+            "justification": state.get("primary_issue", "") + context_suffix,
         }
+
     return base
 
 
@@ -299,33 +349,161 @@ def revise(state: OrchestratorState) -> dict:
     return {"revised_plan": revised, "plan_revised": True, "active_plan": revised}
 
 
-# ── 5. Execute ───────────────────────────────────────────────────────
+# ── 5a. Cascade enrichment ───────────────────────────────────────────
+
+def _compute_revised_eta(ri: dict) -> Optional[str]:
+    """
+    Compute a revised ETA string by adding current_delay_min to window_end.
+    Returns ISO string or None if window_end is not parseable.
+    """
+    window_end = ri.get("window_end", "")
+    delay_min = float(ri.get("current_delay_min", 0.0))
+    if not window_end or delay_min == 0:
+        return None
+    try:
+        base = datetime.fromisoformat(str(window_end).replace("Z", "+00:00"))
+        revised = base + timedelta(minutes=delay_min)
+        return revised.isoformat()
+    except (ValueError, TypeError):
+        return None
+
+
+def _enrich_tool_input(
+    tool_name: str,
+    base_input: dict,
+    cascade_ctx: Dict[str, Any],
+    ri: dict,
+) -> dict:
+    """
+    Dynamically patch a tool's pre-baked input using results accumulated
+    from earlier tools in the same execution run (cascade_ctx).
+
+    cascade_ctx is keyed by tool_name and holds each tool's result dict.
+    ri is the original risk_input for fallback values.
+    """
+    enriched = dict(base_input)
+
+    if tool_name == "notification_agent":
+        # Inject revised ETA
+        revised_eta = _compute_revised_eta(ri)
+        if revised_eta:
+            enriched["revised_eta"] = revised_eta
+
+        # Inject spoilage probability
+        enriched["spoilage_probability"] = ri.get("ml_spoilage_probability", 0.0)
+
+        # Inject facility name from cold_storage result if available
+        cs = cascade_ctx.get("cold_storage_agent", {})
+        facility_name = cs.get("recommended_facility") or ri.get("facility", {}).get("name", "")
+        if facility_name:
+            enriched["facility_name"] = facility_name
+            enriched["message"] = (
+                enriched.get("message", "") +
+                f" Backup facility identified: {facility_name}"
+                + (f" ({cs.get('location', '')})" if cs.get("location") else "") + "."
+            )
+
+    elif tool_name == "scheduling_agent":
+        # Revised ETA
+        revised_eta = _compute_revised_eta(ri)
+        if revised_eta:
+            enriched["revised_eta"] = revised_eta
+
+        # Real facility from cold_storage or ri context
+        cs = cascade_ctx.get("cold_storage_agent", {})
+        facility_record = ri.get("facility", {})
+        facility_loc = cs.get("location") or facility_record.get("location") or "TBD"
+        facility_name = cs.get("recommended_facility") or facility_record.get("name") or "TBD"
+
+        enriched["affected_facilities"] = [f"{facility_name} ({facility_loc})"]
+        enriched["original_eta"] = str(ri.get("window_end", "TBD"))
+
+    elif tool_name == "insurance_agent":
+        # Supporting evidence: compliance log ID from earlier in the chain
+        compliance_result = cascade_ctx.get("compliance_agent", {})
+        log_id = compliance_result.get("log_id")
+        if log_id:
+            enriched["supporting_evidence"] = [log_id]
+
+        # Computed loss — use richer cost components from product_costs.json if available
+        cost_record = ri.get("product_cost", {})
+        components = cost_record.get("cost_components", {})
+        product_chars = cost_record.get("product_characteristics", {})
+        unit_cost = float(cost_record.get("unit_cost_usd", 0.0))
+        units = int(cost_record.get("units_per_shipment", 0))
+        disposal = float(components.get("disposal_cost_per_unit_usd", 0.0))
+        handling = float(components.get("handling_cost_per_shipment_usd", 0.0))
+        multiplier = float(product_chars.get("cold_chain_risk_multiplier", 1.0))
+        spoilage_prob = float(ri.get("ml_spoilage_probability", 0.0))
+        if unit_cost > 0 and units > 0:
+            base = (unit_cost * units + disposal * units + handling) * spoilage_prob
+            enriched["estimated_loss_usd"] = round(base * multiplier, 2)
+
+        # Incident summary already has context_suffix from _build_tool_input;
+        # only append leg excursion total if available from the leg history
+        pass
+
+    elif tool_name == "approval_workflow":
+        # Replace generic proposed_actions with actual tool result summaries
+        action_summaries = []
+        for tname, tresult in cascade_ctx.items():
+            if isinstance(tresult, dict):
+                status = tresult.get("status", "executed")
+                action_summaries.append(f"{tname}: {status}")
+        if action_summaries:
+            enriched["proposed_actions"] = action_summaries
+
+    return enriched
+
+
+# ── 5b. Execute ──────────────────────────────────────────────────────
 
 def execute(state: OrchestratorState) -> dict:
-    """Run each tool in the active plan sequentially."""
+    """
+    Run each tool in the active plan sequentially.
+
+    Key behaviours vs original:
+    - cascade_ctx accumulates every tool result; each tool's input is
+      enriched with results from prior tools before invocation.
+    - approval_workflow no longer causes an early return; execution
+      continues through all remaining steps after queuing approval.
+    - Tool failures are logged and recorded but do not abort the chain.
+    """
     active = state.get("active_plan") or state.get("draft_plan", [])
+    ri = state.get("risk_input", {})
     results: List[ToolResult] = []
     errors: List[str] = []
+    cascade_ctx: Dict[str, Any] = {}
+    approval_id: Optional[str] = None
 
     for step in active:
         tool_name = step["tool"]
-        tool_input = step.get("tool_input", {})
+        base_input = step.get("tool_input", {})
+
         if tool_name not in TOOL_MAP:
             errors.append(f"Tool '{tool_name}' not available")
             continue
+
+        # Dynamically enrich input from prior tool results
+        tool_input = _enrich_tool_input(tool_name, base_input, cascade_ctx, ri)
+
         try:
             tool = TOOL_MAP[tool_name]
             result = tool.invoke(tool_input)
+
+            # Accumulate into cascade context for downstream tools
+            cascade_ctx[tool_name] = result
+
             results.append(ToolResult(
                 tool=tool_name, input=tool_input,
                 result=result, success=True,
             ))
+
+            # Capture approval_id but do NOT stop — continue remaining steps
             if tool_name == "approval_workflow" and isinstance(result, dict):
-                return {
-                    "tool_results": results,
-                    "execution_errors": errors,
-                    "approval_id": result.get("approval_id"),
-                }
+                approval_id = result.get("approval_id")
+                logger.info("EXECUTE  approval queued id=%s, continuing plan", approval_id)
+
         except Exception as exc:
             logger.error("EXECUTE  tool=%s failed: %s", tool_name, exc)
             errors.append(f"{tool_name}: {exc}")
@@ -335,7 +513,12 @@ def execute(state: OrchestratorState) -> dict:
             ))
 
     logger.info("EXECUTE  %d tools run, %d errors", len(results), len(errors))
-    return {"tool_results": results, "execution_errors": errors}
+    return {
+        "tool_results": results,
+        "execution_errors": errors,
+        "cascade_context": cascade_ctx,
+        "approval_id": approval_id,
+    }
 
 
 # ── 6. Build fallback ────────────────────────────────────────────────
