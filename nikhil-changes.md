@@ -1,6 +1,6 @@
-# Session Changes — Cascading Execution, Context Assembly & Data Enrichment
+# Session Changes — Cascading Execution, Context Assembly, Data Enrichment & Extended Scheduling
 
-Summary of all changes made to the SmithAgenticAIChallenge repository in this session. Three areas were addressed: dynamic cascade execution in the orchestrator, a new context assembly layer for per-window enrichment, and comprehensive rewrites of the reference data files.
+Summary of all changes made to the SmithAgenticAIChallenge repository in this session. Four areas were addressed: dynamic cascade execution in the orchestrator, a new context assembly layer for per-window enrichment, comprehensive rewrites of the reference data files, and a full rebuild of the scheduling agent with feasibility checking, backup facility routing, appointment priority ranking, and downstream financial impact estimation.
 
 ---
 
@@ -81,7 +81,22 @@ Insurance was previously appended conditionally after plan generation. It is now
 - Builds a `context_suffix` (`~X.Xh to breach. Delay: <class>.`) appended to messages and incident summaries
 - `notification_agent`: includes `spoilage_probability` and `facility_name` from `ri.facility`
 - `insurance_agent`: includes `leg_id` and `spoilage_probability`
-- `scheduling_agent`: resolves facility name and location from `ri.facility`; falls back to `"facility_TBD"` only when genuinely absent
+- `scheduling_agent`: resolves facility name and location from `ri.facility`; falls back to `"facility_TBD"` only when genuinely absent. Now also passes `delay_class`, `hours_to_breach`, `ml_spoilage_probability`, and `risk_tier` as proper schema fields (previously these were only embedded as text in the `reason` string)
+
+#### Updated `_enrich_tool_input()` — scheduling_agent block
+
+After the existing revised_eta and affected_facilities override, defensive fills ensure the four risk context fields are present even if `_build_tool_input` did not set them (guards prevent overwriting a value that was already placed by the baseline builder):
+
+```python
+if "delay_class" not in enriched:
+    enriched["delay_class"] = ri.get("delay_class", "")
+if "hours_to_breach" not in enriched:
+    enriched["hours_to_breach"] = ri.get("hours_to_breach")
+if "ml_spoilage_probability" not in enriched:
+    enriched["ml_spoilage_probability"] = ri.get("ml_spoilage_probability", 0.0)
+if "risk_tier" not in enriched:
+    enriched["risk_tier"] = ri.get("risk_tier", "")
+```
 
 ---
 
@@ -99,13 +114,123 @@ facility_name: Optional[str]           # Destination or backup facility name fro
 
 ---
 
-### `tools/scheduling_agent.py`
+### `tools/scheduling_agent.py` — fully rewritten
 
-- `facilities.json` loaded once at module level with a process-lifetime cache
-- `revised_eta: Optional[str]` added to `SchedulingInput`
-- `_execute()` looks up the product's facility record to obtain `appointment_count` and `facility_contact`
-- `patient_impact` is derived as `"high"` when appointment count ≥ 10 and a revised ETA is present, `"medium"` otherwise
-- Output includes `total_appointments_affected` and `facility_contact`
+The scheduling agent was rebuilt from a thin recommendation generator into a reasoning layer that evaluates feasibility, selects routing, ranks appointment priority, and estimates financial impact.
+
+#### Problem
+
+The previous implementation unconditionally selected the primary facility, always used the regular `contact` email regardless of timing, derived a binary `high/medium` patient impact from appointment count alone, and never consulted the `backup_facility` block in `facilities.json`. The rich data available — advance notice constraints, operating hours, capacity, emergency contacts, product cost data — was entirely unused.
+
+#### New module-level additions
+
+`product_costs.json` is now loaded at module level with the same process-lifetime cache pattern as `facilities.json`:
+
+```python
+_COSTS_PATH = Path(__file__).resolve().parent.parent / "data" / "product_costs.json"
+_costs_cache: Optional[dict] = None
+
+def _load_product_costs() -> dict: ...
+```
+
+A `_NO_BACKUP` sentinel constant prevents `KeyError` when a product has no `backup_facility` block defined.
+
+#### New helper functions
+
+**`_parse_any_time_window_open(operating_hours, local_dt) -> bool`**
+
+Extracts all `HH:MM-HH:MM` pairs from the facility's `operating_hours` string using a regex and checks whether the given local time falls inside any of them. Day names are deliberately ignored for simplicity. Returns `True` if no operating hours are specified (open assumption). Used by `_check_facility_feasibility`.
+
+**`_check_facility_feasibility(facility_record, revised_eta_iso, now_dt) -> dict`**
+
+Evaluates whether a facility can accept a delivery at the revised ETA. Works identically for primary and backup records — both have the same field schema.
+
+Logic:
+1. `advance_notice_hours = (revised_eta − now).total_seconds() / 3600`
+2. `advance_notice_deficit_hours = advance_notice_hours − min_advance_notice_hours`
+3. `capacity_flag = current_occupancy_pct > 85`
+4. After-hours: converts `now_dt` to facility local time via `ZoneInfo(timezone)`, runs `_parse_any_time_window_open`. Skipped if `pharmacist_on_site_24h` is True.
+5. Contact selection: if `after_hours_flag` or notice is short → use `emergency_contact` + `emergency_phone`, mode = `"emergency"`. Otherwise use regular `contact`, mode = `"standard"`.
+6. `feasible = notice_ok OR accepts_emergency_delivery`. Capacity flag is a warning, not a hard block.
+
+Return dict keys: `feasible`, `routing_reason`, `advance_notice_hours`, `advance_notice_deficit_hours`, `contact_to_use`, `phone_to_use`, `contact_mode`, `capacity_flag`, `capacity_pct`, `after_hours_flag`, `after_hours_note`
+
+**`_rank_appointment_priority(product_cost_data, hours_to_breach) -> dict`**
+
+Computes an appointment priority tier from three signals pulled from `product_costs.json`:
+
+| Signal | Source |
+|---|---|
+| `downstream_disruption_per_appointment_usd` | Normalised by $8,500 (P04 ceiling) |
+| `cold_chain_risk_multiplier` | Product sensitivity weight (1.0–2.5) |
+| `hours_to_breach` urgency amplifier | `<4h → 3×`, `<12h → 2×`, else `1×` |
+
+`score = (disruption_usd / 8500) × multiplier × urgency_factor`
+
+| Score | Priority tier |
+|---|---|
+| ≥ 2.0 | `critical` |
+| ≥ 1.0 | `high` |
+| ≥ 0.4 | `medium` |
+| < 0.4 | `routine` |
+
+Return dict keys: `priority_tier`, `priority_score`, `priority_reason`
+
+**`_resolve_facility_routing(primary_record, backup_record, feasibility_primary, feasibility_backup) -> dict`**
+
+Determines routing from the two feasibility results:
+
+| Condition | Decision |
+|---|---|
+| Both infeasible | `no_feasible_option` |
+| Both feasible + primary capacity flag + backup has appointments | `split` |
+| Both feasible, no capacity issue | `primary` |
+| Only primary feasible | `primary` |
+| Only backup feasible | `backup` |
+
+Return dict keys: `routing_decision`, `routing_summary`
+
+#### Expanded `SchedulingInput`
+
+Five Optional fields added after `reason`. All default to `None` for full backward compatibility with existing callers:
+
+```python
+container_id: Optional[str]            # audit traceability
+delay_class: Optional[str]             # negligible | developing | critical
+hours_to_breach: Optional[float]       # hours until temperature breach
+ml_spoilage_probability: Optional[float]  # 0.0–1.0
+risk_tier: Optional[str]               # LOW | MEDIUM | HIGH | CRITICAL
+```
+
+#### Rewritten `_execute()`
+
+Step-by-step execution:
+1. Load facilities + product costs; resolve `facility_record`, `backup_record`, `cost_record`
+2. `feasibility_primary = _check_facility_feasibility(facility_record, revised_eta, now_dt)`
+3. `feasibility_backup = _check_facility_feasibility(backup_record, ...) if backup_record else _NO_BACKUP`
+4. `routing = _resolve_facility_routing(...)` — determines which facility records are active
+5. `priority = _rank_appointment_priority(cost_record, hours_to_breach)`
+6. `financial_impact_usd = disruption_per_appt × appointment_count × spoilage_prob`
+7. `compliance_flags` collected from facility-level fields: `chain_of_custody_required`, `regulatory_release_required`, `patient_registry_required`, `blood_product_registry_required`
+8. `active_records` selected based on `routing_decision`; one recommendation dict built per active facility
+9. `actions_required` list constructed from compliance flags, after-hours flags, routing decision, spoilage risk, and capacity flags
+10. `summary_line` string assembled: `[TIER] product — routing_summary | Priority: tier | Est. downstream impact: $X | Replacement lead time: Xd expedited`
+
+#### Backward compatibility
+
+All existing outer return keys preserved: `tool`, `status`, `shipment_id`, `product_id`, `reason`, `facility_recommendations`, `total_appointments_affected`, `note`, `requires_approval`, `timestamp`.
+
+All existing per-recommendation keys preserved: `facility`, `facility_contact`, `action`, `appointment_count`, `original_eta`, `revised_eta`, `patient_impact`, `notification_sent`.
+
+All new keys are additive. The `approval_workflow` and any other downstream consumer that reads the existing structure is unaffected.
+
+#### New additive outer keys
+
+`container_id`, `routing_decision`, `routing_summary`, `priority_tier`, `priority_score`, `priority_reason`, `financial_impact_estimate_usd`, `ml_spoilage_probability`, `delay_class`, `hours_to_breach`, `risk_tier`, `compliance_flags`, `actions_required`, `summary_line`, `substitute_available`, `replacement_lead_time_days`, `expedited_lead_time_days`, `cascade_suggested_facilities`
+
+#### New additive per-recommendation keys
+
+`facility_id`, `facility_city`, `facility_country`, `airport_code`, `contact_mode`, `phone`, `advance_notice_hours`, `advance_notice_deficit_hours`, `capacity_pct`, `capacity_flag`, `after_hours_flag`, `after_hours_note`, `feasibility_reason`, `cold_chain_validated`, `certifications`
 
 ---
 
@@ -263,7 +388,72 @@ for pid in ["P01", "P02", "P03", "P04", "P05", "P06"]:
 
 ---
 
-### 3. Individual tool invocations
+### 3. Scheduling agent (unit level)
+
+Verify feasibility checking, priority ranking, and the full tool invocation:
+
+```python
+from tools.scheduling_agent import _rank_appointment_priority, _check_facility_feasibility
+from datetime import datetime, timezone, timedelta
+import json, pathlib
+
+costs = json.loads(pathlib.Path("data/product_costs.json").read_text())
+facs  = json.loads(pathlib.Path("data/facilities.json").read_text())
+
+# Priority: P04 at 2.5h to breach should score critical
+r = _rank_appointment_priority(costs["P04"], hours_to_breach=2.5)
+assert r["priority_tier"] == "critical"
+
+# Priority: P03 with stable temperature should score routine
+r = _rank_appointment_priority(costs["P03"], hours_to_breach=None)
+assert r["priority_tier"] in ("routine", "medium")
+
+# Feasibility: P04 with 4h notice (12h required) — short notice but emergency accepted
+now = datetime(2026, 4, 13, 9, 0, 0, tzinfo=timezone.utc)
+eta = (now + timedelta(hours=4)).isoformat()
+r = _check_facility_feasibility(facs["P04"], eta, now)
+assert r["feasible"] is True
+assert r["contact_mode"] == "emergency"    # short notice forces emergency contact
+assert r["advance_notice_deficit_hours"] < 0
+
+# Feasibility: P01 with 6h notice during business hours — standard contact
+eta_ok = (now + timedelta(hours=6)).isoformat()
+r = _check_facility_feasibility(facs["P01"], eta_ok, now)
+assert r["feasible"] is True
+assert r["contact_mode"] == "standard"
+
+# Full tool invocation with all cascade context fields
+from tools import TOOL_MAP
+result = TOOL_MAP["scheduling_agent"].invoke({
+    "shipment_id": "SHP-TEST-001",
+    "container_id": "CTR-TEST-001",
+    "product_id": "P04",
+    "affected_facilities": ["CryoMed (JFK)"],
+    "original_eta": "2025-01-15T10:00:00+00:00",
+    "revised_eta": "2025-01-15T12:00:00+00:00",
+    "reason": "Cryogenic breach during air handoff.",
+    "delay_class": "critical",
+    "hours_to_breach": 2.0,
+    "ml_spoilage_probability": 0.88,
+    "risk_tier": "CRITICAL",
+})
+assert result["routing_decision"] in ("primary", "backup", "split", "no_feasible_option")
+assert result["priority_tier"] in ("critical", "high")
+assert isinstance(result["actions_required"], list)
+assert "summary_line" in result
+assert result["compliance_flags"] == ["chain_of_custody_required", "regulatory_release_required"]
+# P04: $8500/appt × 8 appts × 0.88 spoilage = $59,840
+assert result["financial_impact_estimate_usd"] == 59840.0
+# Backward compat
+rec = result["facility_recommendations"][0]
+for key in ("facility", "facility_contact", "action", "appointment_count",
+            "original_eta", "revised_eta", "patient_impact", "notification_sent"):
+    assert key in rec
+```
+
+---
+
+### 4. Individual tool invocations
 
 Each tool can be tested in isolation without starting the orchestrator or API:
 
@@ -408,7 +598,12 @@ curl "http://localhost:8000/api/audit-logs?risk_tier=CRITICAL&limit=10"
 | All 6 tools ran for CRITICAL (approval did not halt the chain) | `decision.actions_taken` — length ≥ 5 |
 | `notification_agent` alert has `spoilage_probability_pct` | `actions_taken[notification_agent].result.alert_payload` |
 | `insurance_agent` loss breakdown has correct `risk_multiplier` | `actions_taken[insurance_agent].result.loss_breakdown` |
+| `scheduling_agent` `routing_decision` is set (not absent) | `actions_taken[scheduling_agent].result.routing_decision` |
+| `scheduling_agent` `priority_tier` reflects product and breach timing | `actions_taken[scheduling_agent].result.priority_tier` |
 | `scheduling_agent` shows real facility name, not `facility_TBD` | `actions_taken[scheduling_agent].result.facility_recommendations[0].facility` |
+| `scheduling_agent` `contact_mode` is `"emergency"` when notice is short | `actions_taken[scheduling_agent].result.facility_recommendations[0].contact_mode` |
+| `scheduling_agent` `compliance_flags` populated for P04/P05/P06 | `actions_taken[scheduling_agent].result.compliance_flags` |
+| `scheduling_agent` `financial_impact_estimate_usd` is non-zero | `actions_taken[scheduling_agent].result.financial_impact_estimate_usd` |
 | Compliance `log_id` appears in insurance `supporting_evidence` | Compare `actions_taken[0].result.log_id` vs `actions_taken[4].result.supporting_evidence` |
 | `approval_id` is set and non-null | `decision.approval_id` |
 | `delay_ratio`, `delay_class`, `hours_to_breach` present in API response | `GET /api/risk/score-window/<id>` response body |

@@ -251,6 +251,11 @@ def _build_tool_input(tool_name: str, ri: dict, state: dict) -> dict:
             "affected_facilities": [resolved],
             "original_eta": str(ri.get("window_end", "TBD")),
             "reason": state.get("primary_issue", "") + context_suffix,
+            # Risk context fields — used by extended scheduling logic
+            "delay_class": delay_class,
+            "hours_to_breach": hours_to_breach,
+            "ml_spoilage_probability": ri.get("ml_spoilage_probability", 0.0),
+            "risk_tier": ri.get("risk_tier", ""),
         }
 
     if tool_name == "approval_workflow":
@@ -417,6 +422,16 @@ def _enrich_tool_input(
 
         enriched["affected_facilities"] = [f"{facility_name} ({facility_loc})"]
         enriched["original_eta"] = str(ri.get("window_end", "TBD"))
+
+        # Defensive fill: risk context fields (already set by _build_tool_input; guard prevents overwrite)
+        if "delay_class" not in enriched:
+            enriched["delay_class"] = ri.get("delay_class", "")
+        if "hours_to_breach" not in enriched:
+            enriched["hours_to_breach"] = ri.get("hours_to_breach")
+        if "ml_spoilage_probability" not in enriched:
+            enriched["ml_spoilage_probability"] = ri.get("ml_spoilage_probability", 0.0)
+        if "risk_tier" not in enriched:
+            enriched["risk_tier"] = ri.get("risk_tier", "")
 
     elif tool_name == "insurance_agent":
         # Supporting evidence: compliance log ID from earlier in the chain
