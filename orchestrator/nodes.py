@@ -220,8 +220,15 @@ def _build_tool_input(tool_name: str, ri: dict, state: dict) -> dict:
     if tool_name == "cold_storage_agent":
         return {
             **base,
-            "product_id": ri.get("product_type", ""),
-            "urgency": "critical" if ri.get("risk_tier") == "CRITICAL" else "high",
+            "product_id":          ri.get("product_type", ""),
+            "urgency":             "critical" if ri.get("risk_tier") == "CRITICAL" else "high",
+            "location_hint":       (
+                ri.get("facility", {}).get("airport_code")
+                or ri.get("transit_phase", "")
+            ),
+            "hours_to_breach":     hours_to_breach,
+            "avg_temp_c":          ri.get("avg_temp_c"),
+            "temp_slope_c_per_hr": ri.get("temp_slope_c_per_hr"),
         }
 
     if tool_name == "route_agent":
@@ -462,6 +469,12 @@ def _enrich_tool_input(
                 f" Backup facility identified: {facility_name}"
                 + (f" ({cs.get('location', '')})" if cs.get("location") else "") + "."
             )
+        cs_advance_notice = cs.get("advance_notice_required_hours")
+        cs_temp_range = cs.get("temp_range_supported", "")
+        if cs_advance_notice is not None:
+            enriched["message"] = enriched.get("message", "") + f" Advance notice required: {cs_advance_notice}h."
+        if cs_temp_range:
+            enriched["message"] = enriched.get("message", "") + f" Storage range: {cs_temp_range}."
 
     elif tool_name == "scheduling_agent":
         # Revised ETA
@@ -477,6 +490,14 @@ def _enrich_tool_input(
 
         enriched["affected_facilities"] = [f"{facility_name} ({facility_loc})"]
         enriched["original_eta"] = str(ri.get("window_end", "TBD"))
+
+        # Pass advance notice and temp range from cold_storage result (audit context)
+        cs_advance_notice = cs.get("advance_notice_required_hours")
+        if cs_advance_notice is not None and "advance_notice_required_hours" not in enriched:
+            enriched["advance_notice_required_hours"] = cs_advance_notice
+        cs_temp_range = cs.get("temp_range_supported", "")
+        if cs_temp_range and "temp_range_supported" not in enriched:
+            enriched["temp_range_supported"] = cs_temp_range
 
         # Defensive fill: risk context fields (already set by _build_tool_input; guard prevents overwrite)
         if "delay_class" not in enriched:
@@ -512,6 +533,16 @@ def _enrich_tool_input(
         # Incident summary already has context_suffix from _build_tool_input;
         # only append leg excursion total if available from the leg history
         pass
+
+    elif tool_name == "cold_storage_agent":
+        if "location_hint" not in enriched or not enriched["location_hint"]:
+            enriched["location_hint"] = ri.get("facility", {}).get("airport_code", "")
+        if "hours_to_breach" not in enriched:
+            enriched["hours_to_breach"] = ri.get("hours_to_breach")
+        if "avg_temp_c" not in enriched:
+            enriched["avg_temp_c"] = ri.get("avg_temp_c")
+        if "temp_slope_c_per_hr" not in enriched:
+            enriched["temp_slope_c_per_hr"] = ri.get("temp_slope_c_per_hr")
 
     elif tool_name == "approval_workflow":
         # Replace generic proposed_actions with actual tool result summaries

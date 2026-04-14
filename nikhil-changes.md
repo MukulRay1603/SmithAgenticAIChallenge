@@ -1,6 +1,6 @@
-# Session Changes — Cascading Execution, Context Assembly, Data Enrichment & Extended Scheduling
+# Session Changes — Cascading Execution, Context Assembly, Data Enrichment, Extended Scheduling & Extended Cold Storage
 
-Summary of all changes made to the SmithAgenticAIChallenge repository in this session. Four areas were addressed: dynamic cascade execution in the orchestrator, a new context assembly layer for per-window enrichment, comprehensive rewrites of the reference data files, and a full rebuild of the scheduling agent with feasibility checking, backup facility routing, appointment priority ranking, and downstream financial impact estimation.
+Summary of all changes made to the SmithAgenticAIChallenge repository in this session. Five areas were addressed: dynamic cascade execution in the orchestrator, a new context assembly layer for per-window enrichment, comprehensive rewrites of the reference data files, a full rebuild of the scheduling agent with feasibility checking, backup facility routing, appointment priority ranking, and downstream financial impact estimation, and a full rebuild of the cold storage agent with temperature compatibility scoring, proximity ranking, and structured facility selection.
 
 ---
 
@@ -51,8 +51,9 @@ Called immediately before each `tool.invoke()`. Patches the baseline input using
 
 | Tool | Injected fields |
 |---|---|
-| `notification_agent` | `revised_eta`, `spoilage_probability`, `facility_name` from cold storage result (if available); facility appended to message body |
-| `scheduling_agent` | `revised_eta`, real facility name and location from cascade or `ri.facility` |
+| `notification_agent` | `revised_eta`, `spoilage_probability`, `facility_name` from cold storage result (if available); facility, advance notice hours, and temp range appended to message body |
+| `cold_storage_agent` | `location_hint` back-filled from `ri.facility.airport_code` if absent; `hours_to_breach`, `avg_temp_c`, `temp_slope_c_per_hr` filled from risk input |
+| `scheduling_agent` | `revised_eta`, real facility name and location from cascade or `ri.facility`; `advance_notice_required_hours` and `temp_range_supported` forwarded from cold storage result (audit context) |
 | `insurance_agent` | `supporting_evidence` containing compliance `log_id`; pre-computed `estimated_loss_usd` using the itemised loss formula |
 | `approval_workflow` | `proposed_actions` replaced with actual `tool: status` summaries from all prior steps |
 
@@ -81,6 +82,7 @@ Insurance was previously appended conditionally after plan generation. It is now
 - Builds a `context_suffix` (`~X.Xh to breach. Delay: <class>.`) appended to messages and incident summaries
 - `notification_agent`: includes `spoilage_probability` and `facility_name` from `ri.facility`
 - `insurance_agent`: includes `leg_id` and `spoilage_probability`
+- `cold_storage_agent`: now passes `location_hint` (from `ri.facility.airport_code` or `transit_phase`), `hours_to_breach`, `avg_temp_c`, and `temp_slope_c_per_hr` — previously only passed `product_id` and `urgency`
 - `scheduling_agent`: resolves facility name and location from `ri.facility`; falls back to `"facility_TBD"` only when genuinely absent. Now also passes `delay_class`, `hours_to_breach`, `ml_spoilage_probability`, and `risk_tier` as proper schema fields (previously these were only embedded as text in the `reason` string)
 
 #### Updated `_enrich_tool_input()` — scheduling_agent block
@@ -231,6 +233,106 @@ All new keys are additive. The `approval_workflow` and any other downstream cons
 #### New additive per-recommendation keys
 
 `facility_id`, `facility_city`, `facility_country`, `airport_code`, `contact_mode`, `phone`, `advance_notice_hours`, `advance_notice_deficit_hours`, `capacity_pct`, `capacity_flag`, `after_hours_flag`, `after_hours_note`, `feasibility_reason`, `cold_chain_validated`, `certifications`
+
+---
+
+### `tools/cold_storage_agent.py` — fully rewritten
+
+The cold storage agent was rebuilt from a random stub into a scored, data-driven facility selector.
+
+#### Problem
+
+The previous implementation called `random.choice(FACILITIES)` on a hardcoded list of four fictional facilities that had no relationship to `data/facilities.json`. All three meaningful inputs — `product_id`, `location_hint`, `urgency` — were accepted but ignored. The output (`recommended_facility`, `location`) fed directly into `notification_agent` and `scheduling_agent` in the CRITICAL cascade, meaning both downstream tools were building on a random result.
+
+#### New module-level additions
+
+`facilities.json` and `product_profiles.json` are now loaded with process-lifetime caches following the same pattern as `scheduling_agent.py`:
+
+```python
+_FACILITIES_PATH = Path(__file__).resolve().parent.parent / "data" / "facilities.json"
+_PROFILES_PATH   = Path(__file__).resolve().parent.parent / "data" / "product_profiles.json"
+
+_facilities_cache: Optional[dict] = None
+_profiles_cache:   Optional[dict] = None
+
+def _load_facilities() -> dict: ...
+def _load_profiles() -> dict:    # calls load_product_profiles(_PROFILES_PATH) from src.data_loader
+```
+
+The hardcoded `FACILITIES` list was deleted.
+
+#### New helper functions
+
+**`_parse_temp_range(range_str) -> tuple[float, float]`**
+
+Parses `temp_range_supported` strings from `facilities.json` into `(low, high)` float tuples. Handles two formats present in the data:
+
+| Input | Output |
+|---|---|
+| `"2-8C"`, `"15-25C"` | `(2.0, 8.0)`, `(15.0, 25.0)` |
+| `"-80C to -15C"`, `"-80C to -20C"` | `(-80.0, -15.0)`, `(-80.0, -20.0)` |
+
+Three-pass logic: (1) "TO"-separated split for negative ranges, (2) dash-separated split for positive ranges, (3) regex fallback `re.findall(r"-?\d+(?:\.\d+)?", ...)`. Returns `(-999.0, 999.0)` if all passes fail.
+
+**`_check_temp_compatibility(facility_record, product_id, profiles) -> dict`**
+
+Hard gate: facility is compatible iff `fac_low ≤ prod_low AND fac_high ≥ prod_high`.
+
+Critical edge case — P04 backup (EWR): supports `-80C to -20C`; P04 product requires `-25C to -15C`. Check: `fac_high=-20 ≥ prod_high=-15` evaluates to `False` → **incompatible → disqualified**. P04 primary (JFK) supports `-80C to -15C` → `fac_high=-15 ≥ -15` → compatible.
+
+Return dict keys: `compatible`, `facility_range`, `required_range`, `compatibility_note`
+
+**`_score_facility(facility_record, product_id, location_hint, hours_to_breach, urgency, profiles) -> dict`**
+
+Computes a suitability score for a single facility candidate. Two hard disqualification gates checked first:
+
+1. Temperature incompatibility → `disqualification_reason: "temperature_incompatible"`
+2. `urgency == "critical"` and `accepts_emergency_delivery == False` → `disqualification_reason: "no_emergency_delivery"`
+
+If both gates pass, a weighted composite score is computed:
+
+| Sub-score | Formula | Weight |
+|---|---|---|
+| Capacity | `(100 − occupancy_pct) / 100` | 0.4 |
+| Proximity | 1.0 exact airport match, 0.5 city/string partial, 0.0 none | 0.3 |
+| Notice window | `min(hours_to_breach / min_advance_notice_hours, 1.0)` | 0.2 |
+| Certifications | `min(0.5 + (len(certs) − 1) × 0.1, 1.0)` | 0.1 |
+
+Urgency amplifier on capacity (mirrors `_rank_appointment_priority`): if `hours_to_breach < 4.0` → `capacity_score = min(capacity_score × 1.5, 1.0)`.
+
+Tier thresholds: `≥0.75 → ideal`, `≥0.50 → good`, `≥0.25 → acceptable`, else `last_resort`.
+
+Return dict keys: `suitability_score`, `suitability_tier`, `suitability_reason`, `disqualified`, `disqualification_reason`, `temp_compatibility`
+
+**`_build_candidate_list(product_id, location_hint, hours_to_breach, urgency, profiles) -> list`**
+
+Loads `facilities.json[product_id]`, extracts primary (strips `backup_facility` key, tags `_candidate_role="primary"`) and backup (tags `_candidate_role="backup"`), scores each with `_score_facility()`, and sorts by `(disqualified_bool, -suitability_score)` — viable candidates first, then by score descending. Returns empty list if `product_id` not found.
+
+#### Expanded `ColdStorageInput`
+
+Three Optional fields added after `urgency`. All default to `None` for full backward compatibility:
+
+```python
+hours_to_breach:     Optional[float]  # hours until temp breach at current slope
+avg_temp_c:          Optional[float]  # current average container temp °C
+temp_slope_c_per_hr: Optional[float]  # temperature trend slope °C/hr
+```
+
+#### Rewritten `_execute()`
+
+Step-by-step execution:
+1. `candidates = _build_candidate_list(product_id, location_hint, hours_to_breach, urgency, profiles)`
+2. `primary_rec = candidates[0]`; `alt_facilities = candidates[1:]`
+3. `transfer_window_hours = round(hours_to_breach × 0.8, 2)` — 20% safety margin before breach
+4. `compliance_flags` collected from facility fields: `chain_of_custody_required`, `regulatory_release_required`, `patient_registry_required`, `blood_product_registry_required`
+5. `selection_rationale` built; prefixed with `WARNING:` if all candidates disqualified
+6. `alternative_facilities` array of slim dicts — one per non-primary candidate
+
+#### Backward compatibility
+
+All existing outer return keys preserved: `tool`, `status`, `shipment_id`, `container_id`, `product_id`, `recommended_facility`, `location`, `available_capacity_pct`, `temp_range`, `urgency`, `requires_approval`, `timestamp`.
+
+All new keys are additive: `recommended_facility_id`, `temp_range_supported`, `certifications`, `contact`, `emergency_phone`, `advance_notice_required_hours`, `transfer_window_hours`, `suitability_score`, `suitability_tier`, `alternative_facilities`, `selection_rationale`, `compliance_flags`, `temp_compatibility`, `all_candidates_disqualified`, `avg_temp_c`, `temp_slope_c_per_hr`, `hours_to_breach`.
 
 ---
 
@@ -453,7 +555,68 @@ for key in ("facility", "facility_contact", "action", "appointment_count",
 
 ---
 
-### 4. Individual tool invocations
+### 4. Cold storage agent (unit level)
+
+Verify temperature parsing, compatibility checking, and the full scored selection:
+
+```python
+from tools.cold_storage_agent import _parse_temp_range, _check_temp_compatibility, _load_profiles
+import json
+
+profiles = _load_profiles()
+with open("data/facilities.json") as f:
+    facs = json.load(f)
+
+# Temperature range parsing
+assert _parse_temp_range("2-8C")          == (2.0, 8.0)
+assert _parse_temp_range("15-25C")        == (15.0, 25.0)
+assert _parse_temp_range("-80C to -15C")  == (-80.0, -15.0)
+assert _parse_temp_range("-80C to -20C")  == (-80.0, -20.0)
+
+# P04 primary (JFK): -80 to -15C, product requires -25 to -15C → compatible
+r = _check_temp_compatibility(facs["P04"], "P04", profiles)
+assert r["compatible"] is True
+
+# P04 backup (EWR): -80 to -20C, fac_high=-20 < prod_high=-15 → incompatible
+r = _check_temp_compatibility(facs["P04"]["backup_facility"], "P04", profiles)
+assert r["compatible"] is False
+
+# Full tool invocation — CRITICAL P04 at JFK
+from tools import TOOL_MAP
+result = TOOL_MAP["cold_storage_agent"].invoke({
+    "shipment_id": "SHP-TEST",
+    "container_id": "CTR-TEST",
+    "product_id": "P04",
+    "location_hint": "JFK",
+    "urgency": "critical",
+    "hours_to_breach": 3.0,
+    "avg_temp_c": -12.0,
+    "temp_slope_c_per_hr": 0.5,
+})
+assert result["recommended_facility"] == "CryoMed Advanced Biologics Receiving Centre"
+assert result["suitability_tier"] in ("ideal", "good", "acceptable", "last_resort")
+assert isinstance(result["alternative_facilities"], list)
+assert "temp_compatibility" in result
+# P04 backup is temperature-incompatible — should appear as disqualified in alternatives
+assert result["alternative_facilities"][0]["disqualified"] is True
+assert result["alternative_facilities"][0]["disqualification_reason"] == "temperature_incompatible"
+# transfer_window = hours_to_breach × 0.8
+assert result["transfer_window_hours"] == 2.4
+# Backward compat keys
+for key in ("recommended_facility", "location", "available_capacity_pct",
+            "temp_range", "urgency", "requires_approval", "timestamp"):
+    assert key in result
+
+# Unknown product → no_facility_data status
+r2 = TOOL_MAP["cold_storage_agent"].invoke({
+    "shipment_id": "SHP-X", "container_id": "CTR-X", "product_id": "P99",
+})
+assert r2["status"] == "no_facility_data"
+```
+
+---
+
+### 5. Individual tool invocations
 
 Each tool can be tested in isolation without starting the orchestrator or API:
 
@@ -490,7 +653,7 @@ assert result["loss_breakdown"]["risk_multiplier"] == 2.5
 
 ---
 
-### 4. Full orchestrator cascade (no API required)
+### 6. Full orchestrator cascade (no API required)
 
 The most complete integration test — exercises the entire interpret → plan → reflect → execute chain:
 
@@ -555,7 +718,7 @@ assert decision.get("approval_id") is not None
 
 ---
 
-### 5. API end-to-end
+### 7. API end-to-end
 
 Start the backend:
 
@@ -607,3 +770,9 @@ curl "http://localhost:8000/api/audit-logs?risk_tier=CRITICAL&limit=10"
 | Compliance `log_id` appears in insurance `supporting_evidence` | Compare `actions_taken[0].result.log_id` vs `actions_taken[4].result.supporting_evidence` |
 | `approval_id` is set and non-null | `decision.approval_id` |
 | `delay_ratio`, `delay_class`, `hours_to_breach` present in API response | `GET /api/risk/score-window/<id>` response body |
+| `cold_storage_agent` selects real facility from `facilities.json`, not hardcoded stub | `actions_taken[cold_storage_agent].result.recommended_facility` |
+| `cold_storage_agent` `suitability_tier` is set and facility was scored | `actions_taken[cold_storage_agent].result.suitability_tier` |
+| P04 backup (EWR) appears as disqualified in `alternative_facilities` | `actions_taken[cold_storage_agent].result.alternative_facilities[0].disqualification_reason == "temperature_incompatible"` |
+| `notification_agent` message includes advance notice hours from cold storage | Message body contains `"Advance notice required: Xh."` |
+| `notification_agent` message includes temp range from cold storage | Message body contains `"Storage range: ..."` |
+| `cold_storage_agent` `transfer_window_hours` equals `hours_to_breach × 0.8` | `actions_taken[cold_storage_agent].result.transfer_window_hours` |
