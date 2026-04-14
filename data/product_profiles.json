@@ -24,9 +24,9 @@
   "P03": {
     "name": "Specialty-Med (CRT)",
     "category": "controlled_room_temp",
-    "temp_low": 10.0,
+    "temp_low": 15.0,
     "temp_high": 25.0,
-    "temp_critical_low": 5.0,
+    "temp_critical_low": 8.0,
     "temp_critical_high": 30.0,
     "humidity_max": 75.0,
     "max_excursion_min": 180,

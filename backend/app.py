@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -28,7 +29,8 @@ from backend.models import (
 )
 from tools.approval_workflow import _PENDING_APPROVALS, decide as approve_decide, get_pending
 from tools import TOOL_MAP
-from orchestrator.graph import run_orchestrator, get_graph_mermaid
+from orchestrator.graph import run_orchestrator, get_graph_mermaid, get_mode
+from orchestrator.llm_provider import get_llm, get_provider_name, get_model_name
 from src.context_assembler import build_window_context
 from src.data_loader import load_product_profiles
 
@@ -259,6 +261,7 @@ async def decide_approval(approval_id: str, body: ApprovalDecision):
 
 # ── Orchestrator ─────────────────────────────────────────────────────
 
+_MAX_HISTORY = 500
 _orchestrator_history: List[Dict[str, Any]] = []
 
 
@@ -269,6 +272,8 @@ async def orchestrate_window(window_id: str):
     decision = run_orchestrator(risk_data)
     decision["_window_id"] = window_id
     _orchestrator_history.append(decision)
+    if len(_orchestrator_history) > _MAX_HISTORY:
+        _orchestrator_history[:] = _orchestrator_history[-_MAX_HISTORY:]
     await _broadcast({"type": "orchestrator_decision", "decision": decision})
     return decision
 
@@ -284,8 +289,8 @@ async def orchestrate_batch(window_ids: List[str]):
             decision["_window_id"] = wid
             _orchestrator_history.append(decision)
             results.append(decision)
-        except HTTPException:
-            results.append({"_window_id": wid, "error": "window not found"})
+        except Exception as exc:
+            results.append({"_window_id": wid, "error": str(exc)})
     await _broadcast({"type": "orchestrator_batch", "count": len(results)})
     return results
 
@@ -299,6 +304,77 @@ def orchestrator_history(limit: int = Query(50, le=200)):
 def graph_mermaid():
     """Return the Mermaid diagram of the orchestration graph."""
     return {"mermaid": get_graph_mermaid()}
+
+
+@app.get("/api/orchestrator/mode")
+def orchestrator_mode():
+    """Return the orchestrator's active LLM provider, model, and mode."""
+    return get_mode()
+
+
+@app.get("/api/llm/status")
+def llm_status():
+    """Full LLM provider status: active provider, available providers, and config."""
+    import orchestrator.llm_provider as prov
+    available = []
+    for name in ["ollama", "openai", "anthropic"]:
+        factory = prov._PROVIDERS.get(name)
+        if factory:
+            try:
+                result = factory()
+                available.append({"provider": name, "available": result is not None})
+            except Exception:
+                available.append({"provider": name, "available": False})
+
+    return {
+        "active_provider": get_provider_name(),
+        "active_model": get_model_name(),
+        "mode": "agentic" if get_llm() is not None else "deterministic",
+        "priority": os.environ.get("CARGO_LLM_PRIORITY", "ollama,openai,anthropic"),
+        "providers": available,
+        "keys_configured": {
+            "openai": bool(os.environ.get("OPENAI_API_KEY", "")),
+            "anthropic": bool(os.environ.get("ANTHROPIC_API_KEY", "")),
+        },
+    }
+
+
+@app.post("/api/llm/configure")
+async def configure_llm(config: Dict[str, Any]):
+    """
+    Hot-configure LLM provider settings without restart.
+    Accepts: openai_api_key, anthropic_api_key, priority, ollama_model, openai_model, anthropic_model
+    """
+    import orchestrator.llm_provider as prov
+
+    changed = []
+    if "openai_api_key" in config:
+        os.environ["OPENAI_API_KEY"] = config["openai_api_key"]
+        changed.append("OPENAI_API_KEY")
+    if "anthropic_api_key" in config:
+        os.environ["ANTHROPIC_API_KEY"] = config["anthropic_api_key"]
+        changed.append("ANTHROPIC_API_KEY")
+    if "priority" in config:
+        os.environ["CARGO_LLM_PRIORITY"] = config["priority"]
+        changed.append("CARGO_LLM_PRIORITY")
+    if "ollama_model" in config:
+        os.environ["CARGO_OLLAMA_MODEL"] = config["ollama_model"]
+        changed.append("CARGO_OLLAMA_MODEL")
+    if "openai_model" in config:
+        os.environ["CARGO_OPENAI_MODEL"] = config["openai_model"]
+        changed.append("CARGO_OPENAI_MODEL")
+    if "anthropic_model" in config:
+        os.environ["CARGO_ANTHROPIC_MODEL"] = config["anthropic_model"]
+        changed.append("CARGO_ANTHROPIC_MODEL")
+
+    prov.get_llm(force_refresh=True)
+
+    return {
+        "status": "ok",
+        "changed": changed,
+        "active_provider": prov.get_provider_name(),
+        "active_model": prov.get_model_name(),
+    }
 
 
 @app.get("/api/graph/topology")

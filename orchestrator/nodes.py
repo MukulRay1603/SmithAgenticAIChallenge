@@ -321,31 +321,86 @@ def revise(state: OrchestratorState) -> dict:
 
     existing_tools = {s["tool"] for s in revised}
 
-    for note in notes:
-        if "compliance_covered" in note and "compliance_agent" not in existing_tools:
-            revised.insert(0, PlanStep(
-                step=0, action="Log compliance event (added by reflection)",
-                tool="compliance_agent",
-                tool_input=_build_tool_input("compliance_agent", ri, state),
-                reason="Reflection gap: compliance logging was missing",
-            ))
-            existing_tools.add("compliance_agent")
-        if "notification_included" in note and "notification_agent" not in existing_tools:
-            revised.append(PlanStep(
-                step=0, action="Send stakeholder notification (added by reflection)",
-                tool="notification_agent",
-                tool_input=_build_tool_input("notification_agent", ri, state),
-                reason="Reflection gap: notification was missing",
-            ))
-            existing_tools.add("notification_agent")
-        if "approval_for_irreversible" in note and "approval_workflow" not in existing_tools:
-            revised.append(PlanStep(
-                step=0, action="Request human approval (added by reflection)",
-                tool="approval_workflow",
-                tool_input=_build_tool_input("approval_workflow", ri, state),
-                reason="Reflection gap: approval was missing for HIGH/CRITICAL action",
-            ))
-            existing_tools.add("approval_workflow")
+    note_blob = " ".join(notes).lower()
+
+    needs_compliance = (
+        "compliance_agent" not in existing_tools
+        and ("compliance" in note_blob and "gap" in note_blob)
+    )
+    needs_notification = (
+        "notification_agent" not in existing_tools
+        and ("notification" in note_blob and "gap" in note_blob)
+    )
+    needs_approval = (
+        "approval_workflow" not in existing_tools
+        and ("approval" in note_blob and "gap" in note_blob)
+    )
+    needs_insurance = (
+        "insurance_agent" not in existing_tools
+        and ("insurance" in note_blob and "gap" in note_blob)
+    )
+    tier = ri.get("risk_tier", "LOW")
+    needs_cold_storage = (
+        "cold_storage_agent" not in existing_tools
+        and tier == "CRITICAL"
+        and ("cold" in note_blob or "storage" in note_blob or "facility" in note_blob)
+        and "gap" in note_blob
+    )
+    needs_scheduling = (
+        "scheduling_agent" not in existing_tools
+        and tier in ("CRITICAL", "HIGH")
+        and ("schedul" in note_blob or "reschedul" in note_blob)
+        and "gap" in note_blob
+    )
+
+    if needs_compliance:
+        revised.insert(0, PlanStep(
+            step=0, action="Log compliance event (added by reflection)",
+            tool="compliance_agent",
+            tool_input=_build_tool_input("compliance_agent", ri, state),
+            reason="Reflection gap: compliance logging was missing",
+        ))
+        existing_tools.add("compliance_agent")
+    if needs_notification:
+        revised.append(PlanStep(
+            step=0, action="Send stakeholder notification (added by reflection)",
+            tool="notification_agent",
+            tool_input=_build_tool_input("notification_agent", ri, state),
+            reason="Reflection gap: notification was missing",
+        ))
+        existing_tools.add("notification_agent")
+    if needs_insurance:
+        revised.append(PlanStep(
+            step=0, action="Prepare insurance claim documentation (added by reflection)",
+            tool="insurance_agent",
+            tool_input=_build_tool_input("insurance_agent", ri, state),
+            reason="Reflection gap: insurance claim preparation was missing",
+        ))
+        existing_tools.add("insurance_agent")
+    if needs_cold_storage:
+        revised.append(PlanStep(
+            step=0, action="Identify backup cold-storage facility (added by reflection)",
+            tool="cold_storage_agent",
+            tool_input=_build_tool_input("cold_storage_agent", ri, state),
+            reason="Reflection gap: cold storage needed for CRITICAL temperature event",
+        ))
+        existing_tools.add("cold_storage_agent")
+    if needs_scheduling:
+        revised.append(PlanStep(
+            step=0, action="Generate reschedule recommendations (added by reflection)",
+            tool="scheduling_agent",
+            tool_input=_build_tool_input("scheduling_agent", ri, state),
+            reason="Reflection gap: downstream scheduling needed for delay impact",
+        ))
+        existing_tools.add("scheduling_agent")
+    if needs_approval:
+        revised.append(PlanStep(
+            step=0, action="Request human approval (added by reflection)",
+            tool="approval_workflow",
+            tool_input=_build_tool_input("approval_workflow", ri, state),
+            reason="Reflection gap: approval was missing for HIGH/CRITICAL action",
+        ))
+        existing_tools.add("approval_workflow")
 
     for i, step in enumerate(revised, 1):
         step["step"] = i
@@ -492,7 +547,13 @@ def execute(state: OrchestratorState) -> dict:
     approval_id: Optional[str] = None
 
     for step in active:
-        tool_name = step["tool"]
+        if not isinstance(step, dict):
+            errors.append(f"Invalid step format: {type(step)}")
+            continue
+        tool_name = step.get("tool", "")
+        if not tool_name:
+            errors.append("Step missing 'tool' key")
+            continue
         base_input = step.get("tool_input", {})
 
         if tool_name not in TOOL_MAP:
@@ -573,6 +634,9 @@ def compile_output(state: OrchestratorState) -> dict:
     if tier == "LOW":
         summary = "Monitoring only. All metrics within acceptable range."
         confidence = 0.95
+    elif total_count == 0:
+        summary = f"{tier} risk detected but no tools executed. Manual intervention required."
+        confidence = 0.3
     elif errors:
         summary = f"Partial execution: {success_count}/{total_count} tools succeeded. Manual review needed."
         confidence = 0.5
@@ -608,6 +672,8 @@ def compile_output(state: OrchestratorState) -> dict:
         "requires_approval": state.get("requires_approval", False),
         "approval_reason": state.get("approval_reason", ""),
         "approval_id": state.get("approval_id"),
+        "llm_reasoning": state.get("llm_reasoning", ""),
+        "cascade_context": {k: str(v)[:200] for k, v in state.get("cascade_context", {}).items()},
         "audit_log_summary": f"{total_count} tools executed, {len(errors)} errors, tier={tier}",
         "confidence": confidence,
         "timestamp": datetime.now(timezone.utc).isoformat(),

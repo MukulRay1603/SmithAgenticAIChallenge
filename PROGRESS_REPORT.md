@@ -3,12 +3,14 @@
 ## System Layers
 
 ```
-L1  Data + Risk Engine        DONE     Rahul
-L2  Agent Tools (8 tools)     DONE     Rahul
-L3  Orchestration Agent       DONE     Rahul (deterministic) + Teammate (LLM upgrade)
-L4  FastAPI Backend            DONE     Rahul
-L5  React Dashboard            DONE     Rahul
-L6  Integration + E2E Tests   DONE     Rahul (verified in venv)
+L1  Data + Risk Engine            DONE     Rahul
+L2  Agent Tools (8 tools)         DONE     Rahul + Nikhil (cascade enrichment)
+L3  Orchestration Agent           DONE     Rahul (agentic + deterministic)
+L4  Multi-Provider LLM System     DONE     Rahul (Ollama/OpenAI/Anthropic)
+L5  Context Assembler             DONE     Nikhil (cascade context builder)
+L6  FastAPI Backend               DONE     Rahul
+L7  React Dashboard               DONE     Rahul
+L8  Integration + E2E Tests       DONE     Rahul (verified: all tiers, agentic + deterministic)
 ```
 
 ---
@@ -32,13 +34,21 @@ The orchestrator invokes them via `tool.invoke(input_dict)`.
 ### How tools connect to the orchestrator
 
 ```
-orchestrator/nodes.py :: execute()
-    ↓ for each step in active_plan:
-    ↓   tool = TOOL_MAP[step["tool"]]      ← imported from tools/__init__.py
-    ↓   result = tool.invoke(step["tool_input"])
-    ↓   results.append(ToolResult(...))
-    ↓
-    ↓ if tool is approval_workflow → return early (wait for human)
+Agentic mode (LLM available):
+  orchestrator/llm_nodes.py :: plan_llm()
+      ↓ LLM analyzes risk event and constructs tool inputs
+      ↓ LLM selects which tools to call based on its reasoning
+      ↓ Falls back to _build_tool_input() only for malformed LLM outputs
+
+Execution (shared by both modes):
+  orchestrator/nodes.py :: execute()
+      ↓ for each step in active_plan:
+      ↓   base_input = step["tool_input"]           ← from LLM or template
+      ↓   enriched = _enrich_tool_input(...)         ← cascade enrichment (Nikhil)
+      ↓   result = TOOL_MAP[tool_name].invoke(enriched)
+      ↓   cascade_ctx[tool_name] = result            ← feeds downstream tools
+      ↓
+      ↓ approval_workflow queues approval but does NOT halt chain
 ```
 
 ---
@@ -48,12 +58,14 @@ orchestrator/nodes.py :: execute()
 | Node | File:Function | What it does | Output State Keys |
 |------|--------------|-------------|-------------------|
 | **interpret** | `orchestrator/nodes.py :: interpret_risk()` | Parses risk engine JSON, classifies severity (critical/high/elevated/normal), identifies primary issue from rule flags | `severity, urgency, primary_issue` |
-| **plan** | `orchestrator/nodes.py :: plan()` | Generates draft plan from tier templates (4-6 steps for CRITICAL, 3 for HIGH, 2 for MEDIUM, 0 for LOW). Adds insurance/route steps conditionally | `draft_plan, requires_approval, approval_reason` |
-| **reflect** | `orchestrator/nodes.py :: reflect()` | Checks plan against 5-point compliance checklist: compliance_covered, notification_included, approval_for_irreversible, has_fallback, no_empty_steps | `reflection_notes` |
-| **revise** | `orchestrator/nodes.py :: revise()` | Patches plan to fix gaps (adds missing compliance/notification/approval steps). Only runs if reflect found "GAP" notes | `revised_plan, plan_revised, active_plan` |
-| **execute** | `orchestrator/nodes.py :: execute()` | Calls each tool in active_plan sequentially via LangChain invoke(). Stops early if approval_workflow returns | `tool_results, execution_errors, approval_id` |
+| **plan** (agentic) | `orchestrator/llm_nodes.py :: plan_llm()` | LLM analyzes risk event, reasons about what actions are needed, selects tools, and constructs tool input payloads. Falls back to deterministic templates if LLM unavailable. | `draft_plan, requires_approval, approval_reason, llm_reasoning` |
+| **plan** (deterministic) | `orchestrator/nodes.py :: plan()` | Generates draft plan from tier templates with `_build_tool_input()`. Used when no LLM is available. | `draft_plan, requires_approval, approval_reason` |
+| **reflect** (agentic) | `orchestrator/llm_nodes.py :: reflect_llm()` | LLM critiques the plan against compliance requirements, identifies missing tools. Outputs "GAP [name]:" prefixed notes. | `reflection_notes` |
+| **reflect** (deterministic) | `orchestrator/nodes.py :: reflect()` | Checks plan against 5-point compliance checklist | `reflection_notes` |
+| **revise** | `orchestrator/nodes.py :: revise()` | Patches plan to fix gaps found by reflection. Only runs if reflect found "GAP" notes and plan hasn't been revised yet. | `revised_plan, plan_revised, active_plan` |
+| **execute** | `orchestrator/nodes.py :: execute()` | Calls each tool sequentially with **cascade enrichment** -- each tool's output enriches downstream inputs. Approval queued but does NOT halt chain. | `tool_results, execution_errors, cascade_context, approval_id` |
 | **fallback** | `orchestrator/nodes.py :: build_fallback()` | Creates minimal 2-step backup: escalate to ops manager + log escalation | `fallback_plan` |
-| **output** | `orchestrator/nodes.py :: compile_output()` | Assembles final JSON matching system_prompt.md output format | `final_output, decision_summary, confidence` |
+| **output** | `orchestrator/nodes.py :: compile_output()` | Assembles final JSON with LLM reasoning trace, cascade context summary, and audit log | `final_output, decision_summary, confidence` |
 
 ### Conditional Edges
 
@@ -99,6 +111,9 @@ reflect ──→ output       (if tier is LOW, skip everything)
 | `/api/audit-logs` | GET | Compliance audit records | `backend/app.py` |
 | `/api/approvals/pending` | GET | Pending human approval requests | `backend/app.py` |
 | `/api/approvals/{id}/decide` | POST | Approve or reject an action | `backend/app.py` |
+| `/api/llm/status` | GET | Active LLM provider, available providers, API key config | `backend/app.py` |
+| `/api/llm/configure` | POST | Hot-configure API keys, priority, models without restart | `backend/app.py` |
+| `/api/orchestrator/mode` | GET | Current orchestrator mode (agentic/deterministic) | `backend/app.py` |
 | `/ws/events` | WebSocket | Real-time event stream | `backend/app.py` |
 
 ---
@@ -120,7 +135,7 @@ reflect ──→ output       (if tier is LOW, skip everything)
 
 ## Task Ownership
 
-### Rahul -- Risk Engine, Tools, Backend, Dashboard, Orchestrator (deterministic)
+### Rahul -- Risk Engine, Tools, Backend, Dashboard, Agentic Orchestrator
 
 | # | Task | Status | File(s) |
 |---|------|--------|---------|
@@ -134,20 +149,33 @@ reflect ──→ output       (if tier is LOW, skip everything)
 | 8 | LangGraph risk-scoring pipeline | DONE | `pipeline.py` |
 | 9 | Agent tools (8 LangChain tools) | DONE | `tools/*.py` |
 | 10 | Pydantic schemas | DONE | `backend/models.py` |
-| 11 | FastAPI backend (15 endpoints) | DONE | `backend/app.py` |
+| 11 | FastAPI backend (18 endpoints) | DONE | `backend/app.py` |
 | 12 | React dashboard (8 pages) | DONE | `dashboard/src/components/*.jsx` |
-| 13 | Orchestration agent (deterministic) | DONE | `orchestrator/*.py` |
-| 14 | Graph visualization notebook | DONE | `notebooks/02_orchestration_graphs.ipynb` |
-| 15 | Integration test (E2E in venv) | DONE | Verified all modules import + run |
+| 13 | Orchestration agent (deterministic) | DONE | `orchestrator/nodes.py` |
+| 14 | **Agentic orchestration (LLM-powered)** | DONE | `orchestrator/llm_nodes.py` |
+| 15 | **Multi-provider LLM system** | DONE | `orchestrator/llm_provider.py` |
+| 16 | **API key slot + hot-configure endpoint** | DONE | `backend/app.py` |
+| 17 | Graph visualization notebook | DONE | `notebooks/02_orchestration_graphs.ipynb` |
+| 18 | E2E tests (all tiers, agentic + deterministic) | DONE | Verified in venv |
 
-### Teammate -- Orchestration Agent (LLM upgrade)
+### Nikhil -- Cascade Enrichment & Context Assembler
+
+| # | Task | Status | File(s) |
+|---|------|--------|---------|
+| A | Context assembler (delay_ratio, delay_class, hours_to_breach) | DONE | `src/context_assembler.py` |
+| B | Cascade execution (tool results flow downstream) | DONE | `orchestrator/nodes.py :: _enrich_tool_input()` |
+| C | Enriched facilities.json + product_costs.json | DONE | `data/facilities.json`, `data/product_costs.json` |
+| D | Insurance agent: leg history + loss breakdown | DONE | `tools/insurance_agent.py` |
+| E | Notification agent: revised ETA + facility | DONE | `tools/notification_agent.py` |
+| F | Scheduling agent: resolved facilities + ETA | DONE | `tools/scheduling_agent.py` |
+
+### Open Tasks
 
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
-| A | System prompt design | DONE | -- | `system_prompt.md` |
-| B | Swap plan/reflect nodes to use LLM | OPEN | A, 13 | Replace deterministic logic in `orchestrator/nodes.py` with LLM calls |
-| C | Add LangSmith tracing | OPEN | B | Wrap graph with LangSmith callbacks for observability |
-| D | End-to-end LLM orchestration tests | OPEN | B, C | Test with real OpenAI/Anthropic API key |
+| X1 | Add LangSmith tracing | OPEN | 14 | Wrap graph with LangSmith callbacks for observability |
+| X2 | Dashboard: LLM config panel (API key input UI) | OPEN | 16 | Frontend for `/api/llm/configure` |
+| X3 | Real-time WebSocket push for orchestrator events | OPEN | 11 | Stream tool execution progress |
 
 ---
 
@@ -160,11 +188,11 @@ reflect ──→ output       (if tier is LOW, skip everything)
 | Upgrade `route_agent` to call real routing API | Medium | High | `tools/route_agent.py` -- replace `_execute()` mock |
 | Upgrade `cold_storage_agent` to query facility database | Medium | High | `tools/cold_storage_agent.py` -- replace mock FACILITIES |
 | Upgrade `notification_agent` to send real emails/SMS | Medium | Medium | `tools/notification_agent.py` -- integrate Twilio/SendGrid |
-| Add LLM-powered plan/reflect nodes | Hard | Very High | `orchestrator/nodes.py` -- swap plan() and reflect() to call GPT-4/Claude |
+| Dashboard: LLM config panel (API key input UI) | Medium | High | Build React component for `/api/llm/configure` endpoint |
 | Add LangSmith tracing to orchestrator | Easy | Medium | `orchestrator/graph.py` -- add LangSmith callbacks |
+| Add real-time tool execution progress via WebSocket | Medium | High | Stream each tool's status during `execute()` |
 | Improve data: increase shock/door_open variance | Easy | Medium | Re-run data generation with updated rules |
 | Add P03 (CRT) spoilage scenarios to dataset | Medium | Medium | Update data generation script |
-| Add real-time WebSocket push to dashboard | Medium | High | `backend/app.py` _broadcast() + `dashboard/src/hooks/useApi.js` |
 | Build CI/CD pipeline (GitHub Actions) | Medium | Medium | Add `.github/workflows/test.yml` |
 | Deploy backend to Render/Railway | Medium | High | Add `Dockerfile`, update `Procfile` |
 

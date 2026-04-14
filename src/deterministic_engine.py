@@ -27,9 +27,21 @@ class RuleResult:
     detail: str = ""
 
 
+def _get_profile(row: pd.Series, profiles: Dict[str, dict]) -> dict:
+    """Safely get product profile; returns conservative defaults for unknown products."""
+    pid = row.get("product_id", "")
+    if pid in profiles:
+        return profiles[pid]
+    return {
+        "temp_low": 2.0, "temp_high": 8.0,
+        "temp_critical_low": 0.0, "temp_critical_high": 12.0,
+        "max_excursion_min": 30, "humidity_max": 75.0,
+    }
+
+
 def _rule_temp_breach(row: pd.Series, profiles: Dict[str, dict]) -> RuleResult:
     """Temperature outside acceptable or critical product range."""
-    prof = profiles[row["product_id"]]
+    prof = _get_profile(row, profiles)
     temp = row["avg_temp_c"]
     tl, th = prof["temp_low"], prof["temp_high"]
     cl, ch = prof["temp_critical_low"], prof["temp_critical_high"]
@@ -46,9 +58,9 @@ def _rule_temp_breach(row: pd.Series, profiles: Dict[str, dict]) -> RuleResult:
 def _rule_temp_trend(row: pd.Series, profiles: Dict[str, dict]) -> RuleResult:
     """
     Temperature slope heading toward a breach boundary.
-    Fires when slope > 1.5 C/hr AND current temp is within 2C of a boundary.
+    Fires when |slope| > 1.0 C/hr AND current temp is within 2C of a boundary.
     """
-    prof = profiles[row["product_id"]]
+    prof = _get_profile(row, profiles)
     temp = row["avg_temp_c"]
     slope = row["temp_slope_c_per_hr"]
     tl, th = prof["temp_low"], prof["temp_high"]
@@ -66,8 +78,10 @@ def _rule_temp_trend(row: pd.Series, profiles: Dict[str, dict]) -> RuleResult:
 
 def _rule_excursion_duration(row: pd.Series, profiles: Dict[str, dict]) -> RuleResult:
     """Cumulative minutes outside range exceeds product tolerance."""
-    prof = profiles[row["product_id"]]
+    prof = _get_profile(row, profiles)
     cum = row.get("cumulative_breach_min", 0.0)
+    if pd.isna(cum):
+        cum = 0.0
     threshold = prof["max_excursion_min"]
 
     if cum > threshold:
@@ -92,7 +106,7 @@ def _rule_battery_critical(row: pd.Series, _profiles: Dict[str, dict]) -> RuleRe
 
 def _rule_humidity(row: pd.Series, profiles: Dict[str, dict]) -> RuleResult:
     """Relative humidity above product threshold."""
-    prof = profiles[row["product_id"]]
+    prof = _get_profile(row, profiles)
     hum = row["humidity_avg_pct"]
     limit = prof["humidity_max"]
 
@@ -108,7 +122,7 @@ def _rule_delay_temp_stress(row: pd.Series, profiles: Dict[str, dict]) -> RuleRe
     A delay alone is not dangerous; it becomes risky when the cooling
     system is struggling (temp within 1C of boundary).
     """
-    prof = profiles[row["product_id"]]
+    prof = _get_profile(row, profiles)
     delay = row["current_delay_min"]
     temp = row["avg_temp_c"]
     tl, th = prof["temp_low"], prof["temp_high"]
@@ -132,6 +146,31 @@ def _rule_shock_event(row: pd.Series, _profiles: Dict[str, dict]) -> RuleResult:
     return RuleResult("handling_event", False, 0.0)
 
 
+def _rule_freeze_risk(row: pd.Series, profiles: Dict[str, dict]) -> RuleResult:
+    """
+    Freeze-sensitive products (WHO PQS E006) at risk of freezing.
+    Vaccines like P01, P02, P05, P06 are damaged by freezing and must
+    NEVER be refrozen or exposed to temperatures below 0°C.
+    """
+    prof = _get_profile(row, profiles)
+    if not prof.get("freeze_sensitive", False):
+        return RuleResult("freeze_risk", False, 0.0)
+
+    temp = row["avg_temp_c"]
+    min_temp = row.get("min_temp_c", temp)
+    if pd.isna(min_temp):
+        min_temp = temp
+
+    if min_temp < 0.0:
+        return RuleResult("freeze_exposure", True, 0.50,
+                          f"Freeze-sensitive product exposed to {min_temp:.1f}°C. "
+                          f"Product integrity compromised per WHO PQS E006.")
+    if min_temp < 1.0:
+        return RuleResult("freeze_risk_warning", True, 0.15,
+                          f"Freeze-sensitive product at {min_temp:.1f}°C, approaching 0°C.")
+    return RuleResult("freeze_risk", False, 0.0)
+
+
 ALL_RULES = [
     _rule_temp_breach,
     _rule_temp_trend,
@@ -140,6 +179,7 @@ ALL_RULES = [
     _rule_humidity,
     _rule_delay_temp_stress,
     _rule_shock_event,
+    _rule_freeze_risk,
 ]
 
 

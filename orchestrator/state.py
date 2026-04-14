@@ -38,6 +38,7 @@ class OrchestratorState(TypedDict, total=False):
     plan_revised: bool
     revised_plan: List[PlanStep]
     active_plan: List[PlanStep]
+    llm_reasoning: str
 
     # ── Execution ──
     tool_results: List[ToolResult]

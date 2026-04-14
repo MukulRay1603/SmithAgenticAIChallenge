@@ -84,9 +84,17 @@ def compute_hours_to_breach(
     Returns
     -------
     float   hours until breach (0.0 if already outside range)
-    None    if temperature is stable (|slope| < 0.05 C/hr) or heading away
-            from the nearest boundary
+    None    if temperature is stable (|slope| < 0.05 C/hr), heading away
+            from the nearest boundary, or inputs are invalid/unknown
     """
+    import math
+    if any(math.isnan(v) or math.isinf(v) for v in [avg_temp_c, temp_slope_c_per_hr, temp_low, temp_high]
+           if isinstance(v, float)):
+        return None
+
+    if temp_low <= -900 or temp_high >= 900:
+        return None  # unknown product profile, can't compute meaningful estimate
+
     already_breached = avg_temp_c < temp_low or avg_temp_c > temp_high
     if already_breached:
         return 0.0
@@ -141,14 +149,18 @@ def build_window_context(
     product_id = str(row["product_id"])
     profile = profiles.get(product_id, {})
 
+    if not profile:
+        logger.warning("No product profile for '%s'; using conservative defaults", product_id)
+
     # ── Core telemetry ────────────────────────────────────────────────
     avg_temp = float(row.get("avg_temp_c", 0.0))
     slope = float(row.get("temp_slope_c_per_hr", 0.0))
     delay = float(row.get("current_delay_min", 0.0))
 
-    temp_low = float(profile.get("temp_low", -999))
-    temp_high = float(profile.get("temp_high", 999))
-    max_excursion = float(profile.get("max_excursion_min", 60))
+    # Conservative defaults when profile missing: narrow band triggers alerts
+    temp_low = float(profile.get("temp_low", 2.0))
+    temp_high = float(profile.get("temp_high", 8.0))
+    max_excursion = float(profile.get("max_excursion_min", 30))
 
     # ── Derived cascade fields ────────────────────────────────────────
     delay_ratio = compute_delay_ratio(delay, max_excursion)

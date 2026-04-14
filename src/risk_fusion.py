@@ -39,6 +39,8 @@ HUMAN_APPROVAL_TIERS = {"HIGH", "CRITICAL"}
 
 
 def assign_tier(score: float) -> str:
+    if score is None or (isinstance(score, float) and np.isnan(score)):
+        return "MEDIUM"  # NaN = unknown risk; escalate, don't suppress
     for threshold, tier in TIER_THRESHOLDS:
         if score >= threshold:
             return tier
@@ -60,12 +62,18 @@ def fuse_scores(
     actions : list of recommended action strings
     requires_human : bool
     """
-    blended = alpha * det_score + (1.0 - alpha) * ml_score
-
-    if det_score >= VETO_THRESHOLD:
-        final = max(det_score, blended)
+    if np.isnan(det_score) and np.isnan(ml_score):
+        final = 0.5  # both unknown -> assume elevated risk
+    elif np.isnan(det_score):
+        final = float(ml_score)
+    elif np.isnan(ml_score):
+        final = float(det_score)
     else:
-        final = blended
+        blended = alpha * det_score + (1.0 - alpha) * ml_score
+        if det_score >= VETO_THRESHOLD:
+            final = max(det_score, blended)
+        else:
+            final = blended
 
     final = float(np.clip(final, 0.0, 1.0))
     tier = assign_tier(final)
@@ -86,12 +94,20 @@ def fuse_dataframe(
     """
     df = df.copy()
 
-    det = df["det_score"].values
-    ml = df["ml_score"].values
+    det = df["det_score"].values.astype(float)
+    ml = df["ml_score"].values.astype(float)
 
     blended = alpha * det + (1.0 - alpha) * ml
     veto_mask = det >= VETO_THRESHOLD
     final = np.where(veto_mask, np.maximum(det, blended), blended)
+
+    both_nan = np.isnan(det) & np.isnan(ml)
+    det_nan = np.isnan(det) & ~np.isnan(ml)
+    ml_nan = ~np.isnan(det) & np.isnan(ml)
+    final = np.where(both_nan, 0.5, final)
+    final = np.where(det_nan, ml, final)
+    final = np.where(ml_nan, det, final)
+
     final = np.clip(final, 0.0, 1.0)
 
     df["final_score"] = final

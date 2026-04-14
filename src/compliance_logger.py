@@ -59,9 +59,15 @@ def build_audit_record(
         "window_end": str(row.get("window_end", "")),
         "telemetry_snapshot": {
             "avg_temp_c": _safe_float(row.get("avg_temp_c")),
+            "min_temp_c": _safe_float(row.get("min_temp_c")),
+            "max_temp_c": _safe_float(row.get("max_temp_c")),
+            "temp_slope_c_per_hr": _safe_float(row.get("temp_slope_c_per_hr")),
             "humidity_avg_pct": _safe_float(row.get("humidity_avg_pct")),
             "current_delay_min": _safe_float(row.get("current_delay_min")),
             "battery_avg_pct": _safe_float(row.get("battery_avg_pct")),
+            "shock_count": int(row.get("shock_count", 0)),
+            "door_open_count": int(row.get("door_open_count", 0)),
+            "minutes_outside_range": int(row.get("minutes_outside_range", 0)),
             "transit_phase": row.get("transit_phase", ""),
         },
         "deterministic_score": _safe_float(row.get("det_score")),
@@ -89,9 +95,10 @@ def write_audit_log(
     output_path = output_path or LOG_DIR / f"audit_{ts}.jsonl"
 
     records_written = 0
+    n_shap = len(shap_explanations) if shap_explanations else 0
     with open(output_path, "w") as f:
         for idx, (_, row) in enumerate(df.iterrows()):
-            ml_feats = shap_explanations[idx] if shap_explanations else None
+            ml_feats = shap_explanations[idx] if shap_explanations and idx < n_shap else None
             record = build_audit_record(row, ml_feats)
             f.write(json.dumps(record) + "\n")
             records_written += 1
@@ -103,4 +110,10 @@ def write_audit_log(
 def _safe_float(val: Any) -> Optional[float]:
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
-    return round(float(val), 4)
+    try:
+        f = float(val)
+        if pd.isna(f) or abs(f) == float("inf"):
+            return None
+        return round(f, 4)
+    except (ValueError, TypeError):
+        return None
