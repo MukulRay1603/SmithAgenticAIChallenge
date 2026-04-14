@@ -210,6 +210,10 @@ def score_window(window_id: str):
         "facility": ctx["facility"],
         "product_cost": ctx["product_cost"],
 
+        # Telemetry fields used by cold_storage_agent (temp trend context)
+        "avg_temp_c": ctx["avg_temp_c"],
+        "temp_slope_c_per_hr": ctx["temp_slope_c_per_hr"],
+
         "operational_constraints": [],
         "available_tools": list(TOOL_MAP.keys()),
     }
