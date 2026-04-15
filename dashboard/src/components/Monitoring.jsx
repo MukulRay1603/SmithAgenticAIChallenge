@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { useApi } from '../hooks/useApi';
+import { useApi, getApi } from '../hooks/useApi';
 import { Link } from 'react-router-dom';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Cell,
@@ -38,8 +38,7 @@ export default function Monitoring() {
   const { data: overview } = useApi('/risk/overview');
 
   const loadMore = useCallback(async () => {
-    const res = await fetch(`/api/windows?limit=30&offset=${page * 30}`);
-    const rows = await res.json();
+    const rows = await getApi(`/windows?limit=30&offset=${page * 30}`);
     setFeed(prev => page === 0 ? rows : [...prev, ...rows]);
   }, [page]);
 

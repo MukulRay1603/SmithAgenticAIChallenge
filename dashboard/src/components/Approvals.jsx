@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import { useApi, postApi } from '../hooks/useApi';
+import { useApi, postApi, deleteApi } from '../hooks/useApi';
 import { useWebSocket } from '../hooks/useWebSocket';
 import TierBadge from './TierBadge';
 import {
@@ -69,7 +69,7 @@ export default function Approvals() {
 
   const handleClearAll = useCallback(async () => {
     try {
-      await fetch('/api/approvals', { method: 'DELETE' });
+      await deleteApi('/approvals');
       setExecutionResults({});
       setSelectedTools({});
       await refetch();

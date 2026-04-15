@@ -1,5 +1,6 @@
 import { Routes, Route, NavLink } from 'react-router-dom';
 import { useState, useEffect } from 'react';
+import { getApi } from './hooks/useApi';
 import {
   LayoutDashboard, Ship, ScrollText, CheckCircle, Activity,
   Bot, GitBranch, ShieldAlert, Brain, Wifi, WifiOff, ChevronRight,
@@ -26,7 +27,7 @@ const NAV = [
 function LLMBadge() {
   const [status, setStatus] = useState(null);
   useEffect(() => {
-    const load = () => fetch('/api/llm/status').then(r => r.json()).then(setStatus).catch(() => {});
+    const load = () => getApi('/llm/status').then(setStatus).catch(() => {});
     load();
     const id = setInterval(load, 30000);
     return () => clearInterval(id);

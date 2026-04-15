@@ -26,6 +26,11 @@ export function useApi(path, deps = []) {
   return { data, loading, error, refetch: fetchData };
 }
 
+export async function getApi(path) {
+  const res = await fetch(`${BASE}${path}`);
+  return res.json();
+}
+
 export async function postApi(path, body) {
   const res = await fetch(`${BASE}${path}`, {
     method: 'POST',
@@ -33,4 +38,9 @@ export async function postApi(path, body) {
     body: JSON.stringify(body),
   });
   return res.json();
+}
+
+export async function deleteApi(path) {
+  const res = await fetch(`${BASE}${path}`, { method: 'DELETE' });
+  return res.ok;
 }

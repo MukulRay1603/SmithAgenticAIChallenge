@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import { useApi, postApi } from '../hooks/useApi';
+import { useApi, getApi, postApi, deleteApi } from '../hooks/useApi';
 import { useWebSocket } from '../hooks/useWebSocket';
 import TierBadge from './TierBadge';
 import {
@@ -407,7 +407,7 @@ export default function AgentActivity() {
   const runCriticalBatch = useCallback(async () => {
     setRunning(true);
     try {
-      const windows = await (await fetch('/api/windows?risk_tier=CRITICAL&limit=5')).json();
+      const windows = await getApi('/windows?risk_tier=CRITICAL&limit=5');
       if (Array.isArray(windows) && windows.length > 0) {
         await postApi('/orchestrator/run-batch', windows.map(w => w.window_id));
         await refetch();
@@ -421,7 +421,7 @@ export default function AgentActivity() {
     setRunning(true);
     setDemoResult(null);
     try {
-      const windows = await (await fetch('/api/windows?risk_tier=CRITICAL&limit=1')).json();
+      const windows = await getApi('/windows?risk_tier=CRITICAL&limit=1');
       if (Array.isArray(windows) && windows.length > 0) {
         const result = await postApi(`/orchestrator/run/${windows[0].window_id}`, {});
         if (result && !result.detail) setDemoResult(result);
@@ -553,7 +553,7 @@ export default function AgentActivity() {
                 <RefreshCw className="w-3 h-3" /> Refresh
               </button>
               <button onClick={async () => {
-                await fetch('/api/orchestrator/history', { method: 'DELETE' });
+                await deleteApi('/orchestrator/history');
                 await refetch();
                 setDemoResult(null);
               }} className="flex items-center gap-1.5 text-xs text-red-500/70 hover:text-red-400 transition">
