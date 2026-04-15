@@ -1,3 +1,5 @@
+**Live Demo:** [https://ai-cargo-monitor-prod.vercel.app/](https://ai-cargo-monitor-prod.vercel.app/)
+
 # AI Cargo Monitor -- Pharmaceutical Cold-Chain Risk Intelligence
 
 An end-to-end **agentic AI system** that monitors temperature-sensitive pharmaceutical
