@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -27,7 +28,7 @@ from backend.models import (
     ShipmentSummary,
     WindowRisk,
 )
-from tools.approval_workflow import _PENDING_APPROVALS, decide as approve_decide, get_pending
+from tools.approval_workflow import _PENDING_APPROVALS, decide as approve_decide, get_pending, get_all as get_all_approvals
 from tools.triage_agent import _execute as triage_execute, _enrich_shipment
 from tools import TOOL_MAP
 from orchestrator.graph import run_orchestrator, get_graph_mermaid, get_mode
@@ -255,13 +256,128 @@ def pending_approvals():
     return get_pending()
 
 
+@app.get("/api/approvals/all")
+def all_approvals():
+    """Return ALL approvals (pending, approved, rejected, executed)."""
+    return get_all_approvals()
+
+
+@app.delete("/api/approvals")
+def clear_approvals():
+    """Clear all approval records."""
+    from tools.approval_workflow import _PENDING_APPROVALS
+    count = len(_PENDING_APPROVALS)
+    _PENDING_APPROVALS.clear()
+    return {"cleared": count}
+
+
 @app.post("/api/approvals/{approval_id}/decide")
 async def decide_approval(approval_id: str, body: ApprovalDecision):
     result = approve_decide(approval_id, body.decision, body.decided_by)
     if "error" in result:
         raise HTTPException(404, result["error"])
+
+    window_id = result.get("window_id") or result.get("shipment_id", "")
+    for entry in _orchestrator_history:
+        entry_wid = entry.get("_window_id") or entry.get("window_id", "")
+        if entry_wid == window_id and entry.get("requires_approval"):
+            entry["_approval_status"] = body.decision
+            entry["_approved_by"] = body.decided_by
+            break
+
     await _broadcast({"type": "approval_decided", "result": result})
     return result
+
+
+@app.post("/api/approvals/{approval_id}/execute")
+async def execute_approved(approval_id: str, body: Dict[str, Any] = None):
+    """Execute approved actions — REPLACES the original history entry.
+
+    Always uses selective execution to avoid re-creating approval_workflow.
+    If user selected specific tools, runs only those. Otherwise runs all
+    proposed tools from the original approval minus approval_workflow.
+    """
+    from tools.approval_workflow import _PENDING_APPROVALS
+    from orchestrator.graph import run_orchestrator_selective
+    record = _PENDING_APPROVALS.get(approval_id)
+    if not record:
+        raise HTTPException(404, f"Approval {approval_id} not found")
+    if record.get("status") != "approved":
+        raise HTTPException(400, f"Approval {approval_id} is not approved (status={record.get('status')})")
+
+    window_id = record.get("window_id") or record.get("shipment_id", "")
+    body = body or {}
+    selected_tools = body.get("selected_tools")
+
+    try:
+        risk_data = score_window(window_id)
+    except Exception:
+        risk_data = {
+            "shipment_id": record.get("shipment_id"),
+            "window_id": window_id,
+            "container_id": record.get("container_id"),
+            "risk_tier": record.get("risk_tier", "HIGH"),
+        }
+
+    if not selected_tools:
+        proposed = record.get("proposed_actions", [])
+        selected_tools = [t for t in proposed if t != "approval_workflow" and ":" not in t]
+        if not selected_tools:
+            default_tools = ["compliance_agent", "cold_storage_agent", "notification_agent",
+                             "insurance_agent", "scheduling_agent"]
+            selected_tools = default_tools
+
+    selected_tools = [t for t in selected_tools if t != "approval_workflow"]
+    decision = run_orchestrator_selective(risk_data, selected_tools)
+
+    record["status"] = "executed"
+    record["executed_at"] = datetime.now(timezone.utc).isoformat()
+    record["executed_tools"] = selected_tools
+
+    decision["_window_id"] = window_id
+    decision["_approval_id"] = approval_id
+    decision["_execution_mode"] = "post_approval"
+    decision["_approved_by"] = record.get("decided_by", "operator")
+    decision["_approved_at"] = record.get("decided_at", "")
+
+    replaced = False
+    for i, old in enumerate(_orchestrator_history):
+        old_wid = old.get("_window_id") or old.get("window_id", "")
+        old_aid = None
+        for at in old.get("actions_taken", []):
+            if isinstance(at, dict) and at.get("tool") == "approval_workflow":
+                r = at.get("result", {})
+                if isinstance(r, dict):
+                    old_aid = r.get("approval_id")
+        if old_aid == approval_id or (old_wid == window_id and old.get("requires_approval")):
+            _orchestrator_history[i] = decision
+            replaced = True
+            break
+
+    if not replaced:
+        _orchestrator_history.append(decision)
+
+    await _broadcast({"type": "approval_executed", "approval_id": approval_id, "decision": decision})
+    return decision
+
+
+@app.post("/api/orchestrator/run-selective/{window_id}")
+async def orchestrate_selective(window_id: str, body: Dict[str, Any]):
+    """Run orchestration with human-selected tools only."""
+    selected_tools = body.get("selected_tools", [])
+    if not selected_tools:
+        raise HTTPException(400, "selected_tools list is required")
+
+    from orchestrator.graph import run_orchestrator_selective
+    risk_data = score_window(window_id)
+    decision = run_orchestrator_selective(risk_data, selected_tools)
+    decision["_window_id"] = window_id
+    decision["_execution_mode"] = "human_selective"
+    _orchestrator_history.append(decision)
+    if len(_orchestrator_history) > _MAX_HISTORY:
+        _orchestrator_history[:] = _orchestrator_history[-_MAX_HISTORY:]
+    await _broadcast({"type": "orchestrator_decision", "decision": decision})
+    return decision
 
 
 # ── Orchestrator ─────────────────────────────────────────────────────
@@ -303,6 +419,14 @@ async def orchestrate_batch(window_ids: List[str]):
 @app.get("/api/orchestrator/history")
 def orchestrator_history(limit: int = Query(50, le=200)):
     return list(reversed(_orchestrator_history[-limit:]))
+
+
+@app.delete("/api/orchestrator/history")
+def clear_orchestrator_history():
+    """Clear all orchestration history from memory."""
+    count = len(_orchestrator_history)
+    _orchestrator_history.clear()
+    return {"cleared": count}
 
 
 @app.get("/api/graph/mermaid")
@@ -556,6 +680,85 @@ async def ingest_window(payload: Dict[str, Any]):
 
     await _broadcast({"type": "ingest_scored", "result": result})
     return result
+
+
+# ── Analytics (chart-ready aggregations) ──────────────────────────────
+
+@app.get("/api/analytics")
+def analytics():
+    """Pre-computed distributions for dashboard charts."""
+    import numpy as np
+
+    df = _get_df()
+
+    # 1. Tier counts by transit phase
+    tier_by_phase = (
+        df.groupby(["transit_phase", "risk_tier"])
+        .size()
+        .reset_index(name="count")
+        .to_dict(orient="records")
+    )
+
+    # 2. Score distribution (histogram bins)
+    bins = np.linspace(0, 1, 21)
+    hist_vals, _ = np.histogram(df["final_score"].dropna(), bins=bins)
+    score_histogram = [
+        {"bin_start": round(bins[i], 2), "bin_end": round(bins[i + 1], 2), "count": int(hist_vals[i])}
+        for i in range(len(hist_vals))
+    ]
+
+    # 3. Temperature stats by product
+    temp_by_product = []
+    for pid, grp in df.groupby("product_id"):
+        temp_by_product.append({
+            "product_id": pid,
+            "avg_temp": round(float(grp["avg_temp_c"].mean()), 2),
+            "min_temp": round(float(grp["avg_temp_c"].min()), 2),
+            "max_temp": round(float(grp["avg_temp_c"].max()), 2),
+            "std_temp": round(float(grp["avg_temp_c"].std()), 2),
+            "windows": len(grp),
+            "critical_pct": round(float((grp["risk_tier"] == "CRITICAL").sum() / len(grp) * 100), 1),
+        })
+
+    # 4. Phase distribution with risk breakdown
+    phase_stats = []
+    for phase, grp in df.groupby("transit_phase"):
+        tier_counts = grp["risk_tier"].value_counts().to_dict()
+        phase_stats.append({
+            "phase": str(phase),
+            "total": len(grp),
+            "critical": tier_counts.get("CRITICAL", 0),
+            "high": tier_counts.get("HIGH", 0),
+            "medium": tier_counts.get("MEDIUM", 0),
+            "low": tier_counts.get("LOW", 0),
+            "avg_score": round(float(grp["final_score"].mean()), 4),
+        })
+
+    # 5. Container-level aggregations
+    container_stats = []
+    for (sid, cid), grp in df.groupby(["shipment_id", "container_id"]):
+        container_stats.append({
+            "shipment_id": sid,
+            "container_id": cid,
+            "product_id": grp["product_id"].iloc[0],
+            "windows": len(grp),
+            "max_score": round(float(grp["final_score"].max()), 4),
+            "avg_score": round(float(grp["final_score"].mean()), 4),
+            "avg_temp": round(float(grp["avg_temp_c"].mean()), 2),
+            "risk_tier": grp.sort_values("final_score", ascending=False).iloc[0]["risk_tier"],
+            "critical_windows": int((grp["risk_tier"] == "CRITICAL").sum()),
+            "high_windows": int((grp["risk_tier"] == "HIGH").sum()),
+            "phases": grp["transit_phase"].unique().tolist(),
+        })
+    container_stats.sort(key=lambda c: c["max_score"], reverse=True)
+
+    return {
+        "tier_by_phase": tier_by_phase,
+        "score_histogram": score_histogram,
+        "temp_by_product": temp_by_product,
+        "phase_stats": phase_stats,
+        "container_stats": container_stats[:200],
+    }
 
 
 # ── Helpers ──────────────────────────────────────────────────────────

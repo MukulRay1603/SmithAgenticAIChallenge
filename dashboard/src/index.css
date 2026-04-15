@@ -1,1 +1,97 @@
 @import "tailwindcss";
+
+:root {
+  --bg-base: #0f172a;
+  --bg-surface: #1e293b;
+  --bg-elevated: #334155;
+  --accent-cyan: #06b6d4;
+  --accent-violet: #8b5cf6;
+  --accent-amber: #f59e0b;
+  --accent-rose: #f43f5e;
+  --accent-emerald: #10b981;
+  --glass-bg: rgba(30, 41, 59, 0.7);
+  --glass-border: rgba(148, 163, 184, 0.12);
+  --text-primary: #f1f5f9;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+}
+
+html { font-feature-settings: "cv02", "cv03", "cv04", "cv11"; }
+
+body {
+  margin: 0;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: "Inter", system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+@keyframes pulse-glow {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.animate-slide-up { animation: slide-up 0.4s ease-out both; }
+.animate-fade-in { animation: fade-in 0.3s ease-out both; }
+.animate-pulse-glow { animation: pulse-glow 2s ease-in-out infinite; }
+
+.glass-card {
+  background: var(--glass-bg);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--glass-border);
+  border-radius: 16px;
+}
+
+.glass-card-sm {
+  background: var(--glass-bg);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+}
+
+.gradient-border {
+  position: relative;
+}
+.gradient-border::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(135deg, var(--accent-cyan), var(--accent-violet));
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+.scrollbar-thin::-webkit-scrollbar { width: 6px; }
+.scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+.scrollbar-thin::-webkit-scrollbar-thumb { background: var(--bg-elevated); border-radius: 3px; }
+
+.tier-critical { --tier-color: #ef4444; }
+.tier-high { --tier-color: #f97316; }
+.tier-medium { --tier-color: #eab308; }
+.tier-low { --tier-color: #22c55e; }
+
+.glass-card svg.flowchart,
+.glass-card svg[id^="sys-"],
+.glass-card svg[id^="data-"] {
+  width: 100% !important;
+  max-width: 100%;
+  height: auto !important;
+  min-height: 400px;
+}
+.glass-card .nodeLabel { font-size: 11px !important; }
+.glass-card .edgeLabel { font-size: 10px !important; }

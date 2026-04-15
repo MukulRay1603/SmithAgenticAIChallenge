@@ -55,6 +55,13 @@ class OrchestratorState(TypedDict, total=False):
     # ── Cascade ──
     cascade_context: Dict[str, Any]   # keyed by tool_name; accumulates results during execute
 
+    # ── Observation (post-execution) ──
+    observation: str
+    needs_replan: bool
+    observation_issues: List[str]
+    observation_actions: List[str]
+    replan_count: int              # tracks iterations to prevent infinite loops
+
     # ── Output ──
     decision_summary: str
     audit_log_summary: str

@@ -368,6 +368,11 @@ def revise(state: OrchestratorState) -> dict:
         and ("schedul" in note_blob or "reschedul" in note_blob)
         and "gap" in note_blob
     )
+    needs_route = (
+        "route_agent" not in existing_tools
+        and tier in ("CRITICAL", "HIGH")
+        and ri.get("transit_phase") in ("air_handoff", "customs_clearance")
+    )
 
     if needs_compliance:
         revised.insert(0, PlanStep(
@@ -409,6 +414,14 @@ def revise(state: OrchestratorState) -> dict:
             reason="Reflection gap: downstream scheduling needed for delay impact",
         ))
         existing_tools.add("scheduling_agent")
+    if needs_route:
+        revised.append(PlanStep(
+            step=0, action="Evaluate alternative routing options (added by safety net)",
+            tool="route_agent",
+            tool_input=_build_tool_input("route_agent", ri, state),
+            reason="Shipment is in a reroute-sensitive phase; route evaluation is required",
+        ))
+        existing_tools.add("route_agent")
     if needs_approval:
         revised.append(PlanStep(
             step=0, action="Request human approval (added by reflection)",
@@ -572,7 +585,8 @@ def _enrich_tool_input(
             enriched["temp_slope_c_per_hr"] = ri.get("temp_slope_c_per_hr")
 
     elif tool_name == "approval_workflow":
-        # Replace generic proposed_actions with actual tool result summaries
+        enriched.setdefault("window_id", ri.get("window_id"))
+        enriched.setdefault("container_id", ri.get("container_id"))
         action_summaries = []
         for tname, tresult in cascade_ctx.items():
             if isinstance(tresult, dict):
@@ -586,22 +600,32 @@ def _enrich_tool_input(
 
 # ── 5b. Execute ──────────────────────────────────────────────────────
 
+_DEPENDS_ON = {
+    "notification_agent": ["cold_storage_agent"],
+    "scheduling_agent": ["cold_storage_agent"],
+    "insurance_agent": ["compliance_agent"],
+    "approval_workflow": [],
+}
+
+
 def execute(state: OrchestratorState) -> dict:
     """
-    Run each tool in the active plan sequentially.
+    Run each tool in the active plan sequentially with result-awareness.
 
-    Key behaviours vs original:
-    - cascade_ctx accumulates every tool result; each tool's input is
-      enriched with results from prior tools before invocation.
-    - approval_workflow no longer causes an early return; execution
-      continues through all remaining steps after queuing approval.
-    - Tool failures are logged and recorded but do not abort the chain.
+    Key behaviours:
+    - cascade_ctx accumulates every tool result for downstream enrichment.
+    - If a tool that a downstream tool depends on FAILED, the downstream tool
+      gets a warning injected but still runs (with degraded inputs).
+    - If cold_storage_agent finds no facility, notification_agent's message
+      is adjusted to reflect that.
+    - approval_workflow runs last regardless.
     """
     active = state.get("active_plan") or state.get("draft_plan", [])
     ri = state.get("risk_input", {})
     results: List[ToolResult] = []
     errors: List[str] = []
     cascade_ctx: Dict[str, Any] = {}
+    failed_tools: set = set()
     approval_id: Optional[str] = None
 
     for step in active:
@@ -618,35 +642,47 @@ def execute(state: OrchestratorState) -> dict:
             errors.append(f"Tool '{tool_name}' not available")
             continue
 
-        # Dynamically enrich input from prior tool results
+        upstream_failures = [
+            dep for dep in _DEPENDS_ON.get(tool_name, [])
+            if dep in failed_tools
+        ]
+        if upstream_failures:
+            logger.warning("EXECUTE  %s: upstream %s failed, running with degraded context",
+                           tool_name, upstream_failures)
+
         tool_input = _enrich_tool_input(tool_name, base_input, cascade_ctx, ri)
+
+        if tool_name == "notification_agent":
+            cs = cascade_ctx.get("cold_storage_agent", {})
+            cs_status = cs.get("status", "") if isinstance(cs, dict) else ""
+            if "cold_storage_agent" in failed_tools or cs_status == "no_facility_found":
+                tool_input["message"] = tool_input.get("message", "") + \
+                    " WARNING: No backup cold-storage facility could be identified."
 
         try:
             tool = TOOL_MAP[tool_name]
             result = tool.invoke(tool_input)
-
-            # Accumulate into cascade context for downstream tools
             cascade_ctx[tool_name] = result
-
             results.append(ToolResult(
                 tool=tool_name, input=tool_input,
                 result=result, success=True,
             ))
 
-            # Capture approval_id but do NOT stop — continue remaining steps
             if tool_name == "approval_workflow" and isinstance(result, dict):
                 approval_id = result.get("approval_id")
-                logger.info("EXECUTE  approval queued id=%s, continuing plan", approval_id)
+                logger.info("EXECUTE  approval queued id=%s", approval_id)
 
         except Exception as exc:
             logger.error("EXECUTE  tool=%s failed: %s", tool_name, exc)
             errors.append(f"{tool_name}: {exc}")
+            failed_tools.add(tool_name)
             results.append(ToolResult(
                 tool=tool_name, input=tool_input,
-                result={"error": str(exc)}, success=False,
+                result={"error": str(exc), "status": "failed"}, success=False,
             ))
 
-    logger.info("EXECUTE  %d tools run, %d errors", len(results), len(errors))
+    logger.info("EXECUTE  %d tools run, %d errors, %d failed",
+                len(results), len(errors), len(failed_tools))
     return {
         "tool_results": results,
         "execution_errors": errors,
@@ -733,7 +769,11 @@ def compile_output(state: OrchestratorState) -> dict:
         "llm_reasoning": state.get("llm_reasoning", ""),
         "cascade_context": state.get("cascade_context", {}),
         "cascade_summary": {k: str(v)[:200] for k, v in state.get("cascade_context", {}).items()},
-        "audit_log_summary": f"{total_count} tools executed, {len(errors)} errors, tier={tier}",
+        "observation": state.get("observation", ""),
+        "observation_issues": state.get("observation_issues", []),
+        "replan_count": state.get("replan_count", 0),
+        "audit_log_summary": f"{total_count} tools executed, {len(errors)} errors, tier={tier}"
+            + (f", replanned {state.get('replan_count', 0)}x" if state.get("replan_count", 0) > 0 else ""),
         "confidence": confidence,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }

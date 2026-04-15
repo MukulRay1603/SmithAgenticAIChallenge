@@ -22,6 +22,8 @@ class ApprovalInput(BaseModel):
     requested_by: str = Field(
         default="orchestrator", description="Agent or system requesting approval"
     )
+    window_id: Optional[str] = Field(default=None, description="Window ID for re-execution")
+    container_id: Optional[str] = Field(default=None, description="Container ID")
 
 
 def _execute(
@@ -32,11 +34,15 @@ def _execute(
     proposed_actions: List[str] | None = None,
     justification: str = "",
     requested_by: str = "orchestrator",
+    window_id: Optional[str] = None,
+    container_id: Optional[str] = None,
 ) -> dict:
     approval_id = f"APR-{uuid.uuid4().hex[:8].upper()}"
     record = {
         "approval_id": approval_id,
         "shipment_id": shipment_id,
+        "window_id": window_id,
+        "container_id": container_id,
         "action_description": action_description,
         "risk_tier": risk_tier,
         "urgency": urgency,
@@ -63,6 +69,13 @@ def _execute(
 
 def get_pending() -> List[dict]:
     return [v for v in _PENDING_APPROVALS.values() if v["status"] == "pending"]
+
+
+def get_all() -> List[dict]:
+    """Return all approvals sorted by created_at descending."""
+    items = list(_PENDING_APPROVALS.values())
+    items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return items
 
 
 def decide(approval_id: str, decision: str, decided_by: str = "operator") -> dict:

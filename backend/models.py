@@ -156,11 +156,14 @@ class AuditRecord(BaseModel):
 class ApprovalRequest(BaseModel):
     approval_id: str
     shipment_id: str
+    window_id: Optional[str] = None
+    container_id: Optional[str] = None
     action_description: str
     risk_tier: str
     urgency: str
     proposed_actions: List[str]
     justification: str
+    requested_by: Optional[str] = None
     status: str
     created_at: str
     decided_at: Optional[str] = None

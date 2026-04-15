@@ -49,7 +49,7 @@ def main():
     for _, row in df.iterrows():
         record = row.where(row.notna(), other=None).to_dict()
         try:
-            sb.table("telemetry").insert(record).execute()
+            sb.table("window_features").insert(record).execute()
             logger.info(
                 "  → inserted %s | shipment %s | risk_label=%s",
                 record.get("window_id"), record.get("shipment_id"),

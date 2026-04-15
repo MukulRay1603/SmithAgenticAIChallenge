@@ -16,7 +16,7 @@ import re
 from typing import Any, Dict, List
 
 from orchestrator.llm_provider import get_llm
-from orchestrator.state import OrchestratorState, PlanStep
+from orchestrator.state import OrchestratorState, PlanStep, ToolResult
 from tools import TOOL_MAP
 
 logger = logging.getLogger(__name__)
@@ -175,11 +175,16 @@ Construct real tool_input values using the risk event data. Use actual shipment_
             return det_plan(state)
 
         draft: List[PlanStep] = []
+        seen_tools: set = set()
         for s in parsed["steps"]:
             tool_name = s.get("tool", "")
             if tool_name not in TOOL_MAP:
                 logger.warning("AGENT_PLAN: unknown tool '%s', skipping", tool_name)
                 continue
+            if tool_name in seen_tools:
+                logger.debug("AGENT_PLAN: skipping duplicate %s", tool_name)
+                continue
+            seen_tools.add(tool_name)
 
             llm_input = s.get("tool_input", {})
             if not isinstance(llm_input, dict) or not llm_input:
@@ -305,3 +310,208 @@ Respond with ONLY this JSON:
         logger.error("AGENT_REFLECT failed (%s), falling back", exc)
         from orchestrator.nodes import reflect as det_reflect
         return det_reflect(state)
+
+
+# ── Agentic Revise ───────────────────────────────────────────────────
+
+REVISE_SYSTEM = """You are a pharmaceutical cold-chain action plan editor.
+You receive a draft plan and reflection notes (which may contain GAP warnings).
+Your job: produce a CORRECTED plan that addresses every gap.
+
+RULES:
+- Keep all existing valid steps. Do NOT remove steps that are already correct.
+- Add missing tools identified in GAP notes. Place compliance_agent FIRST, approval_workflow LAST.
+- IMPORTANT: Each tool should appear EXACTLY ONCE in the plan. Do NOT duplicate any tool.
+- Construct real tool_input using the shipment data provided. No placeholders.
+- Return ONLY valid JSON."""
+
+
+def revise_llm(state: OrchestratorState) -> dict:
+    """LLM rewrites the plan to fix gaps identified during reflection."""
+    llm = get_llm()
+    if llm is None:
+        from orchestrator.nodes import revise as det_revise
+        return det_revise(state)
+
+    ri = state["risk_input"]
+    draft = state.get("draft_plan", [])
+    notes = state.get("reflection_notes", [])
+
+    plan_text = "\n".join(
+        f"  {s.get('step', i)}. [{s.get('tool', '?')}] {s.get('action', '?')}"
+        for i, s in enumerate(draft, 1) if isinstance(s, dict)
+    )
+    notes_text = "\n".join(f"  - {n}" for n in notes)
+
+    user_msg = f"""Fix this action plan based on the reflection gaps.
+
+SHIPMENT CONTEXT:
+  shipment_id: {ri.get('shipment_id')}
+  container_id: {ri.get('container_id')}
+  window_id: {ri.get('window_id')}
+  risk_tier: {ri.get('risk_tier')}
+  product_type: {ri.get('product_type')}
+  transit_phase: {ri.get('transit_phase')}
+  ml_spoilage_probability: {ri.get('ml_spoilage_probability')}
+
+CURRENT PLAN:
+{plan_text}
+
+REFLECTION NOTES (fix ALL gaps):
+{notes_text}
+
+AVAILABLE TOOLS:
+{TOOLS_REFERENCE}
+
+Return ONLY this JSON:
+{{
+  "steps": [
+    {{"step": 1, "action": "...", "tool": "tool_name", "tool_input": {{...}}, "reason": "..."}}
+  ]
+}}"""
+
+    try:
+        response = llm.invoke([
+            {"role": "system", "content": REVISE_SYSTEM},
+            {"role": "user", "content": user_msg},
+        ])
+        parsed = _extract_json(response.content)
+
+        if not parsed or "steps" not in parsed:
+            logger.warning("AGENT_REVISE: unparseable, falling back to deterministic")
+            from orchestrator.nodes import revise as det_revise
+            return det_revise(state)
+
+        revised: List[PlanStep] = []
+        seen_tools: set = set()
+        for s in parsed["steps"]:
+            tool_name = s.get("tool", "")
+            if tool_name not in TOOL_MAP:
+                continue
+            if tool_name in seen_tools:
+                logger.debug("AGENT_REVISE: skipping duplicate %s", tool_name)
+                continue
+            seen_tools.add(tool_name)
+            llm_input = s.get("tool_input", {})
+            if not isinstance(llm_input, dict) or not llm_input:
+                from orchestrator.nodes import _build_tool_input
+                llm_input = _build_tool_input(tool_name, ri, state)
+            revised.append(PlanStep(
+                step=len(revised) + 1,
+                action=s.get("action", f"Execute {tool_name}"),
+                tool=tool_name,
+                tool_input=llm_input,
+                reason=s.get("reason", ""),
+            ))
+
+        if not revised:
+            logger.warning("AGENT_REVISE: 0 valid steps, falling back")
+            from orchestrator.nodes import revise as det_revise
+            return det_revise(state)
+
+        logger.info("AGENT_REVISE: %d steps (was %d)", len(revised), len(draft))
+        return {"revised_plan": revised, "plan_revised": True, "active_plan": revised}
+
+    except Exception as exc:
+        logger.error("AGENT_REVISE failed (%s), falling back", exc)
+        from orchestrator.nodes import revise as det_revise
+        return det_revise(state)
+
+
+# ── Agentic Observe (post-execution reflection) ──────────────────────
+
+OBSERVE_SYSTEM = """You are a pharmaceutical cold-chain operations supervisor.
+You review tool execution results and decide if the response was adequate.
+
+If a critical tool failed or returned inadequate results, recommend specific
+corrective actions. If all tools succeeded, confirm the response is adequate.
+Return ONLY valid JSON."""
+
+
+def observe_llm(state: OrchestratorState) -> dict:
+    """LLM reviews execution results and decides if re-planning is needed."""
+    ri = state["risk_input"]
+    tier = ri.get("risk_tier", "LOW")
+
+    if tier in ("LOW", "MEDIUM"):
+        return {"observation": "adequate", "needs_replan": False}
+
+    tool_results = state.get("tool_results", [])
+    errors = state.get("execution_errors", [])
+
+    if not tool_results:
+        return {"observation": "no tools executed", "needs_replan": tier in ("CRITICAL", "HIGH")}
+
+    llm = get_llm()
+    if llm is None:
+        failed = [r["tool"] for r in tool_results if not r.get("success")]
+        return {
+            "observation": f"deterministic check: {len(failed)} failures",
+            "needs_replan": len(failed) > 0 and tier == "CRITICAL",
+            "failed_tools": failed,
+        }
+
+    results_text = ""
+    for r in tool_results:
+        status = "SUCCESS" if r.get("success") else "FAILED"
+        result_data = r.get("result", {})
+        result_summary = ""
+        if isinstance(result_data, dict):
+            result_summary = ", ".join(
+                f"{k}={repr(v)[:60]}" for k, v in list(result_data.items())[:5]
+            )
+        results_text += f"\n  [{status}] {r['tool']}: {result_summary}"
+
+    if errors:
+        results_text += "\n  ERRORS: " + "; ".join(errors)
+
+    user_msg = f"""Review these execution results for a {tier} risk event.
+
+CONTEXT:
+  shipment_id: {ri.get('shipment_id')}
+  risk_tier: {tier}
+  product: {ri.get('product_type')}
+  spoilage_probability: {ri.get('ml_spoilage_probability')}
+
+EXECUTION RESULTS:{results_text}
+
+Questions to answer:
+1. Did cold_storage_agent find a viable facility? (check status != "no_facility_found")
+2. Did compliance_agent detect violations that need escalation?
+3. Were any critical tools missing from execution?
+4. Is the overall response adequate for a {tier} event?
+
+Return ONLY this JSON:
+{{
+  "observation": "brief assessment of execution quality",
+  "adequate": true/false,
+  "issues": ["list of specific issues found, empty if adequate"],
+  "recommended_actions": ["additional tools to run or actions needed, empty if adequate"]
+}}"""
+
+    try:
+        response = llm.invoke([
+            {"role": "system", "content": OBSERVE_SYSTEM},
+            {"role": "user", "content": user_msg},
+        ])
+        parsed = _extract_json(response.content)
+
+        if not parsed:
+            return {"observation": "unparseable", "needs_replan": False}
+
+        adequate = parsed.get("adequate", True)
+        issues = parsed.get("issues", [])
+        recommended = parsed.get("recommended_actions", [])
+
+        logger.info("AGENT_OBSERVE: adequate=%s, issues=%d, recommended=%d",
+                     adequate, len(issues), len(recommended))
+        return {
+            "observation": parsed.get("observation", ""),
+            "needs_replan": not adequate and tier == "CRITICAL",
+            "observation_issues": issues,
+            "observation_actions": recommended,
+        }
+
+    except Exception as exc:
+        logger.error("AGENT_OBSERVE failed (%s)", exc)
+        return {"observation": f"error: {exc}", "needs_replan": False}

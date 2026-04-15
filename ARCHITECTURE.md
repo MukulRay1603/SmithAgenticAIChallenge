@@ -117,18 +117,22 @@
 │  │  ┌───────────┐    ┌──────┐    ┌─────────┐    ┌────────┐               │       │
 │  │  │ interpret  │───→│ plan │───→│ reflect │───→│ revise │               │       │
 │  │  └───────────┘    └──────┘    └────┬────┘    └───┬────┘               │       │
-│  │                                    │             │                     │       │
-│  │                        ┌───────────┘             │                     │       │
-│  │                        │  (conditional)          │                     │       │
-│  │                        ▼                         ▼                     │       │
-│  │                   LOW → output         ┌─────────┐    ┌──────────┐    │       │
-│  │                   GAP → revise         │ execute  │───→│ fallback │    │       │
-│  │                   OK  → execute        └─────────┘    └────┬─────┘    │       │
-│  │                                                            │          │       │
-│  │                                                            ▼          │       │
-│  │                                                       ┌────────┐     │       │
-│  │                                                       │ output │──→END│       │
-│  │                                                       └────────┘     │       │
+│  │       ▲                            │             │                     │       │
+│  │       │                ┌───────────┘             │                     │       │
+│  │       │                │  (conditional)          │                     │       │
+│  │       │                ▼                         ▼                     │       │
+│  │       │           LOW → output         ┌─────────┐    ┌─────────┐    │       │
+│  │       │           GAP → revise         │ execute  │───→│ observe │    │       │
+│  │       │           OK  → execute        └─────────┘    └────┬────┘    │       │
+│  │       │                                     (conditional)  │          │       │
+│  │       │                                                    ▼          │       │
+│  │       │  (replan_bridge, if CRITICAL + failures)    adequate?         │       │
+│  │       └───────────── YES ◄─────────────────────     │                │       │
+│  │                                              ┌──────┘                │       │
+│  │                                              ▼                        │       │
+│  │                                   ┌──────────┐    ┌────────┐         │       │
+│  │                                   │ fallback  │───→│ output │──→END  │       │
+│  │                                   └──────────┘    └────────┘         │       │
 │  └─────────────────────────────────────────────────────────────────────────┘       │
 │                                                                                    │
 │  NODE DETAIL (see Section 5 below for full I/O)                                    │
@@ -158,7 +162,7 @@
 ┌────────────────────────────────────────────────────────────────────────────────────┐
 │              LAYER 6: BACKEND + DASHBOARD                                          │
 │                                                                                    │
-│  backend/app.py  (FastAPI, 22 endpoints + WebSocket)                               │
+│  backend/app.py  (FastAPI, 25 endpoints + WebSocket)                               │
 │  ├─ Risk data:     /api/risk/overview, /api/shipments, /api/windows                │
 │  ├─ Orchestrator:  /api/orchestrator/run/{id}, /api/orchestrator/run-batch         │
 │  ├─ Tools:         /api/tools/{name}/execute                                       │
@@ -426,22 +430,35 @@ CHECKS:
 OUTPUT: reflection_notes (same format as agentic)
 ```
 
-### 5f. revise
+### 5f. revise (agentic + deterministic fallback)
 
 ```
-FILE: orchestrator/nodes.py :: revise()
-MODE: Always deterministic (keyword matching on GAP notes)
+FILE: orchestrator/llm_nodes.py :: revise_llm()  |  fallback: nodes.py :: revise()
+MODE: Agentic (Groq LLM)  |  Falls back to deterministic keyword matching
 
-Scans reflection_notes for keywords:
-  "compliance" + "gap"  → inserts compliance_agent at position 0
-  "notification" + "gap" → appends notification_agent
-  "insurance" + "gap"   → appends insurance_agent
-  "cold"/"storage" + "gap" → appends cold_storage_agent (CRITICAL only)
-  "schedul" + "gap"     → appends scheduling_agent (CRITICAL/HIGH)
-  "approval" + "gap"    → appends approval_workflow (always last)
+AGENTIC MODE (revise_llm):
+  LLM receives:
+    - draft_plan (JSON)
+    - reflection_notes (with GAP annotations)
+    - risk context (tier, product, temp, etc.)
+  LLM rewrites the full plan:
+    - Adds missing tools to fill every GAP
+    - Constructs correct tool_input payloads
+    - Deduplication: seen_tools set prevents same tool appearing twice
+    - System prompt: "Each tool should appear EXACTLY ONCE"
+  Falls back to deterministic if LLM response is unparseable
+
+DETERMINISTIC FALLBACK (revise):
+  Scans reflection_notes for keywords:
+    "compliance" + "gap"  → inserts compliance_agent at position 0
+    "notification" + "gap" → appends notification_agent
+    "insurance" + "gap"   → appends insurance_agent
+    "cold"/"storage" + "gap" → appends cold_storage_agent (CRITICAL only)
+    "schedul" + "gap"     → appends scheduling_agent (CRITICAL/HIGH)
+    "approval" + "gap"    → appends approval_workflow (always last)
 
 OUTPUT (merged into state):
-  revised_plan → List[PlanStep] (patched copy of draft_plan)
+  revised_plan → List[PlanStep] (rewritten plan with all gaps filled)
   active_plan  → same as revised_plan
   plan_revised → True
 ```
@@ -457,6 +474,14 @@ FOR EACH STEP in active_plan:
   2. enriched  = _enrich_tool_input(...)        ← cascade enrichment
   3. result    = TOOL_MAP[tool_name].invoke(enriched)
   4. cascade_ctx[tool_name] = result            ← feeds downstream tools
+  5. if error → failed_tools.add(tool_name)    ← dependency tracking
+
+DEPENDENCY AWARENESS (_DEPENDS_ON map):
+  notification_agent depends on cold_storage_agent
+  scheduling_agent   depends on cold_storage_agent
+  insurance_agent    depends on compliance_agent
+  If upstream tool failed, downstream tool gets injected warning:
+    "_upstream_warning": "cold_storage_agent failed: ..."
 
 CASCADE ENRICHMENT (_enrich_tool_input):
   ┌────────────────────┬──────────────────────────────────────────────────┐
@@ -490,6 +515,39 @@ OUTPUT (merged into state):
   execution_errors→ List[str]
   cascade_context → Dict[tool_name → result_dict]
   approval_id     → str or None
+```
+
+### 5g-bis. observe (agentic)
+
+```
+FILE: orchestrator/llm_nodes.py :: observe_llm()
+MODE: Agentic (Groq LLM)  |  Falls back to deterministic no-op
+
+LLM receives:
+  - tool_results (per-tool success/failure + result summaries)
+  - execution_errors (list of error messages)
+  - risk_tier, active_plan
+
+LLM OUTPUT FORMAT:
+  { "adequate": bool,
+    "issues": ["..."],
+    "actions": ["..."] }
+
+CONDITIONAL EDGE (_should_replan):
+  needs_replan=True AND replan_count < MAX_REPLAN(=1) AND tier is CRITICAL
+    → "replan" (goes to replan_bridge → plan)
+  otherwise
+    → "finalize" (goes to fallback → output)
+
+replan_bridge node:
+  Increments replan_count by 1
+  Copies observation_issues into reflection_notes for next plan iteration
+
+OUTPUT (merged into state):
+  observation         → str (LLM summary of execution quality)
+  needs_replan        → bool
+  observation_issues  → List[str]
+  observation_actions → List[str]
 ```
 
 ### 5h. fallback
@@ -582,15 +640,19 @@ INPUT:
 
 OUTPUT:
   tool              str    "route_agent"
-  status            str    "alternative_found"
+  status            str    "recommendation_generated"
   recommended_route str    Route description
   carrier           str    Carrier name (temp-class-aware)
   eta_change_hours  float  ETA impact
   temp_class        str    "frozen" | "refrigerated" | "CRT"
+  selection_method  str    "llm" | "rule_based"
+  selection_rationale str  Why this carrier/route was selected
   requires_approval bool   True for mode changes
 
-LOGIC: Looks up product temp_class from profiles → selects carrier from _ROUTE_TABLE
-       sorted by urgency keywords in reason field
+LOGIC: Looks up product temp_class from profiles → builds safe candidate options
+       from _ROUTE_TABLE → if an LLM is available, asks it to choose ONE provided
+       option only based on product safety, urgency, and preferred mode →
+       falls back to deterministic urgency sorting if LLM is unavailable/fails
 ```
 
 ### 6c. cold_storage_agent
@@ -761,6 +823,15 @@ OUTPUT:
   status       str    "approval_requested"
   approval_id  str    "APR-XXXXXXXX" (UUID-based)
   message      str    Human-readable status
+
+POST-APPROVAL EXECUTION (backend/app.py :: execute_approved):
+  When an operator approves and clicks Execute:
+    1. Extracts proposed_actions from approval record
+    2. Filters out "approval_workflow" (prevents ghost approvals)
+    3. Runs run_orchestrator_selective() — bypasses LangGraph entirely
+       (interpret → execute → observe → compile, no LLM plan overwrite)
+    4. Replaces original history entry in-place (no duplicate rows)
+    5. Human can also select specific tools via UI toggles
 ```
 
 ---
@@ -768,7 +839,7 @@ OUTPUT:
 ## 7. Conditional Edge Logic
 
 ```
-orchestrator/graph.py :: _should_revise(state)
+orchestrator/graph.py :: _should_revise(state)  +  _should_replan(state)
 
   ┌──────────────┐
   │   reflect     │
@@ -782,6 +853,16 @@ orchestrator/graph.py :: _should_revise(state)
          │
          └── otherwise
              └── "execute"  (plan is good, run it)
+
+  ┌──────────────┐
+  │   observe     │
+  └──────┬───────┘
+         │
+         ├── needs_replan AND replan_count < 1 AND tier == CRITICAL ?
+         │   └── YES → "replan"  (replan_bridge increments count, loops to plan)
+         │
+         └── otherwise
+             └── "finalize"  (fallback → output → END)
 ```
 
 ---

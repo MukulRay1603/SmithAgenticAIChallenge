@@ -51,7 +51,9 @@ FDA/GDP audit trails -- all powered by a LangGraph pipeline with a React dashboa
 ┌──────────────────────────────────────────────────────────────────────┐
 │  LAYER 4: AGENTIC ORCHESTRATION  (LangGraph StateGraph)              │
 │                                                                      │
-│  interpret → plan (LLM) → reflect (LLM) → [revise] → execute → out  │
+│  interpret → plan(LLM) → reflect(LLM) → [revise(LLM)] → execute    │
+│                                                     → observe(LLM)  │
+│                                              [replan ←┘] → output   │
 │                                                │                     │
 │                 ┌──────────────────────────────┘                     │
 │                 │  cascade enrichment: each tool's output            │
@@ -68,7 +70,7 @@ FDA/GDP audit trails -- all powered by a LangGraph pipeline with a React dashboa
            ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │  LAYER 5: BACKEND + DASHBOARD                                        │
-│  FastAPI (22 endpoints + WebSocket)                                  │
+│  FastAPI (25 endpoints + WebSocket)                                  │
 │  React 19 + Vite + Tailwind v4 + Recharts + Mermaid                 │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -169,7 +171,7 @@ AI_cargo/
 │
 ├── tools/                         LangChain StructuredTools (8 agents)
 │   ├── compliance_agent.py        RAG compliance (pgvector + Groq LLM + audit log)
-│   ├── route_agent.py             Temp-class-aware routing from product profiles
+│   ├── route_agent.py             LLM-assisted safe route selection from certified route options
 │   ├── cold_storage_agent.py      Facility lookup with suitability scoring
 │   ├── notification_agent.py      Multi-channel stakeholder alerts
 │   ├── scheduling_agent.py        Facility reschedule with financial impact
@@ -191,7 +193,7 @@ AI_cargo/
 │   └── simulate_stream.py         CSV replay → Supabase for testing
 │
 ├── backend/                       FastAPI REST + WebSocket API
-│   ├── app.py                     22 endpoints + WebSocket + LLM config
+│   ├── app.py                     25 endpoints + WebSocket + LLM config
 │   └── models.py                  Pydantic schemas (risk engine ↔ orchestrator)
 │
 ├── dashboard/                     React + Vite + Tailwind + Recharts
@@ -263,7 +265,7 @@ which tools to call AND constructs the tool input payloads -- it is not a
 template executor.
 
 ```
-interpret → plan (LLM) → reflect (LLM) → [revise if gaps] → execute → fallback → output
+interpret → plan(LLM) → reflect(LLM) → [revise(LLM) if gaps] → execute → observe(LLM) → [replan?] → fallback → output
 ```
 
 ### Orchestration Nodes
@@ -275,10 +277,12 @@ interpret → plan (LLM) → reflect (LLM) → [revise if gaps] → execute → 
 | **plan** | Deterministic fallback | Tier-based templates with `_build_tool_input()` |
 | **reflect** | **Agentic** (Groq LLM) | LLM critiques plan against GDP/FDA compliance requirements |
 | **reflect** | Deterministic fallback | 5-point checklist |
-| **revise** | Deterministic | Patches plan to fix gaps found by reflection |
-| **execute** | Deterministic | Calls tools sequentially with cascade enrichment |
+| **revise** | **Agentic** (Groq LLM) | LLM rewrites plan to fix all gaps, deduplicates tools |
+| **revise** | Deterministic fallback | Keyword scan on GAP notes, inserts missing tools |
+| **execute** | Deterministic | Result-aware cascade execution with dependency tracking (`failed_tools`, `_DEPENDS_ON` map) |
+| **observe** | **Agentic** (Groq LLM) | Inspects execution results, triggers re-plan for CRITICAL failures (max 1 loop) |
 | **fallback** | Deterministic | Minimal backup plan if execution had errors |
-| **output** | Deterministic | Assembles final JSON with LLM reasoning trace |
+| **output** | Deterministic | Assembles final JSON with LLM reasoning, observation, and re-plan count |
 
 ### Cascade Enrichment
 
@@ -291,6 +295,19 @@ During execution, each tool's output enriches inputs to downstream tools:
 | `compliance_agent` | `insurance_agent` | log_id as supporting evidence |
 | Product cost data | `insurance_agent` | estimated_loss_usd |
 | All tools | `approval_workflow` | consolidated action summaries |
+
+### Human-in-the-Loop Approval Flow
+
+The approval workflow ensures human control over irreversible actions:
+
+1. **Orchestration runs** -- LLM plans and executes tools, including `approval_workflow`
+2. **Approval created** -- Dashboard shows pending request in Approvals tab
+3. **Operator decides** -- Approve or reject; can select specific tools to run
+4. **Post-approval execution** -- `run_orchestrator_selective()` bypasses the LangGraph
+   entirely (no LLM plan overwrite), running only the approved tools. The
+   `approval_workflow` tool is automatically excluded to prevent ghost approvals.
+5. **History updated** -- Original entry replaced in-place (no duplicate rows)
+6. **WebSocket sync** -- Agent Activity updates in real-time via `approval_executed` events
 
 ### RAG Compliance Agent
 
@@ -327,7 +344,7 @@ All data access goes through `src/supabase_client.py` with automatic local fallb
 | `product_profiles` | 6 | deterministic engine, all agents | `data/product_profiles.json` |
 | `product_costs` | 6 | insurance, scheduling agents | `data/product_costs.json` |
 | `facilities` | 6 | cold_storage, insurance, scheduling | `data/facilities.json` |
-| `compliance_knowledge` | variable | RAG compliance agent (pgvector) | mock regulations |
+| `compliance_knowledge` | 417 | RAG compliance agent (pgvector) | regulations from documents |
 | `compliance_docs` | (Storage bucket) | PDF ingestion pipeline | (none) |
 
 ---
@@ -354,7 +371,10 @@ All data access goes through `src/supabase_client.py` with automatic local fallb
 | `/api/graph/topology` | GET | Full 5-layer system topology JSON |
 | `/api/audit-logs` | GET | Compliance audit records |
 | `/api/approvals/pending` | GET | Pending human approval requests |
+| `/api/approvals/all` | GET | All approvals (pending + approved + rejected) |
 | `/api/approvals/{id}/decide` | POST | Approve or reject an action |
+| `/api/approvals/{id}/execute` | POST | Execute approved plan (skips approval_workflow to prevent ghost approvals) |
+| `/api/orchestrator/history` | DELETE | Clear in-memory orchestration history |
 | `/api/llm/status` | GET | Active LLM provider, available providers |
 | `/api/llm/configure` | POST | Hot-configure API keys, priority, models |
 | `/ws/events` | WebSocket | Real-time event stream |

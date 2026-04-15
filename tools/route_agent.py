@@ -15,12 +15,15 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
+
+from orchestrator.llm_provider import get_llm
 
 logger = logging.getLogger(__name__)
 
@@ -104,14 +107,18 @@ _ROUTE_TABLE = {
 }
 
 
-def _select_route(temp_class: str, preferred_mode: Optional[str], reason: str) -> dict:
+def _candidate_options(temp_class: str, preferred_mode: Optional[str]) -> List[tuple[str, str, int]]:
     class_routes = _ROUTE_TABLE.get(temp_class, _ROUTE_TABLE["refrigerated"])
 
     mode_key = "default"
     if preferred_mode and preferred_mode.lower() in class_routes:
         mode_key = preferred_mode.lower()
 
-    options = class_routes[mode_key]
+    return list(class_routes[mode_key])
+
+
+def _select_route_rule_based(temp_class: str, preferred_mode: Optional[str], reason: str) -> dict:
+    options = _candidate_options(temp_class, preferred_mode)
 
     reason_lower = reason.lower()
     if any(word in reason_lower for word in ("urgent", "critical", "immediate", "emergency")):
@@ -123,6 +130,95 @@ def _select_route(temp_class: str, preferred_mode: Optional[str], reason: str) -
         "carrier": carrier,
         "eta_change_hours": eta_delta,
     }
+
+
+def _response_text(resp: Any) -> str:
+    content = getattr(resp, "content", resp)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text", "")))
+            else:
+                parts.append(str(getattr(item, "text", item)))
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def _extract_json(text: str) -> Dict[str, Any]:
+    text = text.strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _select_route_llm(
+    temp_class: str,
+    preferred_mode: Optional[str],
+    reason: str,
+    product_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    llm = get_llm()
+    if llm is None:
+        return None
+
+    options = _candidate_options(temp_class, preferred_mode)
+    if not options:
+        return None
+
+    option_rows = [
+        {
+            "index": i,
+            "route": route,
+            "carrier": carrier,
+            "eta_change_hours": eta_delta,
+        }
+        for i, (route, carrier, eta_delta) in enumerate(options)
+    ]
+
+    prompt = (
+        "You are choosing a pharmaceutical cold-chain reroute.\n"
+        "Choose exactly one option from the provided candidates only.\n"
+        "Prioritize product temperature safety first, then urgency/ETA, then preferred mode.\n"
+        "Return JSON only: {\"selected_index\": <int>, \"rationale\": \"<1 sentence>\"}\n\n"
+        f"Product ID: {product_id or 'unknown'}\n"
+        f"Temperature class: {temp_class}\n"
+        f"Preferred mode: {preferred_mode or 'auto'}\n"
+        f"Reason: {reason}\n"
+        f"Options: {json.dumps(option_rows)}"
+    )
+
+    try:
+        resp = llm.invoke(prompt)
+        payload = _extract_json(_response_text(resp))
+        idx = int(payload.get("selected_index", -1))
+        if idx < 0 or idx >= len(option_rows):
+            return None
+        chosen = option_rows[idx]
+        return {
+            "recommended_route": chosen["route"],
+            "carrier": chosen["carrier"],
+            "eta_change_hours": chosen["eta_change_hours"],
+            "selection_method": "llm",
+            "selection_rationale": str(payload.get("rationale", "")).strip(),
+        }
+    except Exception as exc:
+        logger.warning("route_agent LLM selection failed: %s", exc)
+        return None
 
 
 class RouteInput(BaseModel):
@@ -149,11 +245,17 @@ def _execute(
     preferred_mode: Optional[str] = None,
 ) -> dict:
     temp_class = _get_temp_class(product_id) if product_id else "refrigerated"
-    route = _select_route(temp_class, preferred_mode, reason)
+    route = _select_route_llm(temp_class, preferred_mode, reason, product_id)
+    if route is None:
+        route = {
+            **_select_route_rule_based(temp_class, preferred_mode, reason),
+            "selection_method": "rule_based",
+            "selection_rationale": "Deterministic fallback selected the best candidate from the route table.",
+        }
 
     logger.info(
-        "route_agent: shipment=%s product=%s temp_class=%s → %s",
-        shipment_id, product_id, temp_class, route["recommended_route"],
+        "route_agent: shipment=%s product=%s temp_class=%s method=%s → %s",
+        shipment_id, product_id, temp_class, route.get("selection_method"), route["recommended_route"],
     )
 
     return {
@@ -167,6 +269,8 @@ def _execute(
         "eta_change_hours": route["eta_change_hours"],
         "temp_class": temp_class,
         "reason": reason,
+        "selection_method": route.get("selection_method", "rule_based"),
+        "selection_rationale": route.get("selection_rationale", ""),
         "requires_approval": True,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -178,7 +282,8 @@ route_tool = StructuredTool.from_function(
     description=(
         "Recommend an alternative route or carrier for a shipment. "
         "Selects route based on product temperature class (frozen/refrigerated/CRT) "
-        "and preferred transport mode. Returns a route option with ETA impact. "
+        "and preferred transport mode. Uses the configured LLM to choose among "
+        "safe candidate options, with deterministic fallback. Returns a route option with ETA impact. "
         "Does NOT auto-execute; requires human approval."
     ),
     args_schema=RouteInput,
