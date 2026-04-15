@@ -420,7 +420,3 @@ All data access goes through `src/supabase_client.py` with automatic local fallb
 | **Compliance** | JSONL audit logs, SHAP explainability, human-in-the-loop |
 
 
-
-
-
-
