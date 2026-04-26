@@ -1,14 +1,44 @@
 """
-Triage Agent — multi-shipment urgency ranking with real data enrichment.
+Triage Agent — Multi-Shipment Urgency Ranking and Orchestration Prioritisation
+===============================================================================
 
-Accepts a list of shipment risk summaries and returns them ranked
-by urgency: CRITICAL first, then HIGH, then MEDIUM, then LOW.
-Within each tier, higher fused_risk_score ranks first.
+Designed and implemented by Mukul Ray (Team Synapse, UMD Agentic AI Challenge 2026).
+Co-developed with Rahul Sharma.
 
-Enriches each shipment with real excursion data from scored_windows.csv:
-hours at risk, peak temperature, primary breach rule, product name.
+Also authored the backend API endpoints for triage:
+  GET /api/triage/critical-shipments  — auto-pulls CRITICAL+HIGH rows, worst per shipment
+  POST /api/triage/rank               — ranks caller-supplied shipment list
 
-Author: Mukul Ray (ray/agents-final), integrated by Rahul
+Architecture
+------------
+The triage agent solves a specific problem: when multiple shipments are at risk
+simultaneously, the orchestrator needs a prioritised queue, not a flat list.
+This agent produces that queue before any orchestration decisions are made.
+
+Ranking logic (two-key sort):
+  Primary key:  tier priority  CRITICAL=0, HIGH=1, MEDIUM=2, LOW=3
+  Secondary key: fused_risk_score descending within each tier
+
+Enrichment (when enrich=True):
+  Joins to artifacts/scored_windows.csv by shipment_id to compute:
+    - hours_at_risk: breach_windows × 0.5h per window
+    - peak_temp_c: maximum temperature recorded across all windows
+    - primary_breach_rule: most frequently fired rule (Counter-based)
+    - product_name, total_windows, windows_in_breach
+
+Output contract
+---------------
+Returns priority_list (all shipments, ranked) and recommended_orchestration_order
+(CRITICAL + HIGH only) — the latter is what the orchestrator's plan node uses to
+decide execution sequence when running batch orchestration.
+
+Cascade position
+----------------
+Called before orchestration. Results feed directly into run_orchestrator_selective()
+and the /api/orchestrator/run-batch endpoint in backend/app.py.
+
+Author: Mukul Ray (Team Synapse, UMD Agentic AI Challenge 2026)
+Co-author: Rahul Sharma
 """
 from __future__ import annotations
 

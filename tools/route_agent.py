@@ -1,18 +1,46 @@
 """
-Route Agent — context-aware route recommendation.
+Route Agent — Hybrid Rule-Based + LLM-Assisted Cold-Chain Route Selection
+==========================================================================
 
-Selects an alternative route based on:
-  - product temperature class (frozen / refrigerated / CRT)
-  - preferred_mode if specified
-  - reason/urgency signal
-  - real origin/destination from Supabase shipments table
+Designed and implemented by Mukul Ray (Team Synapse, UMD Agentic AI Challenge 2026).
+Integrated into the orchestration cascade by Rahul Sharma.
 
-Reads real product data from product_profiles.json to determine the
-appropriate carrier certification class.  When a shipments table row
-is available in Supabase, the route agent uses the actual origin and
-destination to generate context-aware LLM recommendations.
+Architecture
+------------
+This agent recommends alternative cold-chain routes when a shipment is at risk.
+It operates in two layers:
 
-Author: Mukul Ray (ray/agents-final), integrated by Rahul
+  Layer 1 — Deterministic rule engine:
+    Classifies the product into one of three temperature classes (frozen / refrigerated / crt)
+    based on the product profile's safe_temp_high value, then looks up the _ROUTE_TABLE
+    for candidate routes matched to that class and the preferred transport mode.
+    Sorts by ETA delta (ascending) when urgency keywords are detected in the reason field.
+
+  Layer 2 — LLM candidate selection (optional, graceful fallback):
+    Sends the candidate list plus real Supabase route context (origin, destination, carrier,
+    weather, delay probability) to the active LLM provider. Parses a selected_index from
+    the structured JSON response. Falls back to the rule-based selection on any parse or
+    LLM failure — the agent never fails hard.
+
+Design decisions
+----------------
+- Temperature class taxonomy drives route selection, not product ID directly.
+  This keeps the route table maintainable as new products are added.
+- LLM selection is optional enrichment, not a dependency. The rule-based fallback
+  ensures deterministic behavior during LLM outages or rate limiting.
+- requires_approval is always True — route changes are irreversible operational decisions
+  that require human sign-off via the approval workflow.
+- Real Supabase route data (weather, delay prob, actual origin/destination) is injected
+  into the LLM prompt to ground its reasoning in live shipment context.
+
+Cascade position
+----------------
+Called by the orchestrator for CRITICAL/HIGH tiers when transit_phase is air_handoff
+or customs_clearance. Output flows into the scheduling agent and notification agent
+via cascade_context injection in orchestrator/nodes.py (_enrich_tool_input).
+
+Author: Mukul Ray (ray/agents-final branch, commit 063c93e)
+Integrated: Rahul Sharma (v0.3, April 14 2026)
 """
 from __future__ import annotations
 

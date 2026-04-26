@@ -1,3 +1,42 @@
+"""
+Insurance Agent — Itemised Financial Loss Calculation and Claim Package Assembly
+==================================================================================
+
+Cascade design and integration by Mukul Ray (Team Synapse, UMD Agentic AI Challenge 2026).
+Loss formula and leg history analytics implemented collaboratively (Nikhil Sumesh, Rahul Sharma).
+
+Architecture
+------------
+The insurance agent is the final analytical step in the spoilage cascade before
+human review. It aggregates excursion evidence, computes itemised financial loss,
+and assembles a complete claim package ready for director sign-off.
+
+Cascade position
+----------------
+Called after compliance_agent and cold_storage_agent have run. The compliance
+log_id (from compliance_agent output) is injected as supporting_evidence via
+orchestrator/nodes.py (_enrich_tool_input), creating a direct audit chain from
+regulatory decision to financial claim.
+
+Loss model (4 components)
+--------------------------
+  1. product_loss      = unit_cost × units × spoilage_probability × cold_chain_risk_multiplier
+  2. disposal_cost     = fixed cost from product_costs.json
+  3. downstream_cost   = disruption_per_appointment × appointment_count × spoilage_probability
+  4. handling_cost     = sunk cost (paid regardless of outcome)
+
+Human gate
+----------
+The assembled claim package is never submitted automatically. It is returned as
+a structured dict for the approval_workflow to hold pending director sign-off.
+This is by design — insurance claims have legal and financial consequences that
+require human accountability.
+
+Claim ID format: CLM-{uuid8} (generated at runtime, unique per incident)
+
+Author (cascade design): Mukul Ray
+Implementation: Nikhil Sumesh, Rahul Sharma, Mukul Ray
+"""
 from __future__ import annotations
 
 import json
