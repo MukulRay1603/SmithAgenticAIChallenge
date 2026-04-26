@@ -16,7 +16,7 @@ import re
 from typing import Any, Dict, List
 
 from orchestrator.llm_provider import get_llm
-from orchestrator.state import OrchestratorState, PlanStep, ToolResult
+from orchestrator.state import OrchestratorState, PlanStep
 from tools import TOOL_MAP
 
 logger = logging.getLogger(__name__)

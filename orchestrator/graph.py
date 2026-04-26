@@ -95,8 +95,17 @@ def _skip_if_low(state: OrchestratorState) -> str:
 
 
 def _should_revise(state: OrchestratorState) -> str:
-    """After reflect: always revise (notification is always deferred)."""
-    return "revise"
+    """After reflect: route to revise if reflection notes flag gaps or deferred tools exist; else human_review."""
+    reflection_notes = state.get("reflection_notes", [])
+    deferred_tools = state.get("deferred_tools", [])
+    gap_keywords = ("gap", "miss", "fail", "incomplete", "need", "should", "must", "critical", "unaddressed")
+    has_gaps = any(
+        any(kw in str(note).lower() for kw in gap_keywords)
+        for note in reflection_notes
+    )
+    if has_gaps or deferred_tools:
+        return "revise"
+    return "human_review"
 
 
 # ── Human review node ────────────────────────────────────────────────

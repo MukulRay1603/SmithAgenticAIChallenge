@@ -65,6 +65,7 @@ _profiles_cache: Optional[dict] = None
 
 
 def _load_profiles() -> dict:
+    """Load product profiles from Supabase with local JSON fallback."""
     global _profiles_cache
     if _profiles_cache is None:
         try:
@@ -159,6 +160,7 @@ _ROUTE_TABLE = {
 
 
 def _candidate_options(temp_class: str, preferred_mode: Optional[str]) -> List[tuple[str, str, int]]:
+    """Return candidate route tuples (route_str, carrier, eta_delta_hours) for the given temp class and mode."""
     class_routes = _ROUTE_TABLE.get(temp_class, _ROUTE_TABLE["refrigerated"])
 
     mode_key = "default"
@@ -169,6 +171,7 @@ def _candidate_options(temp_class: str, preferred_mode: Optional[str]) -> List[t
 
 
 def _select_route_rule_based(temp_class: str, preferred_mode: Optional[str], reason: str) -> dict:
+    """Select the best route deterministically; sorts by shortest ETA delta when urgency keywords appear in reason."""
     options = _candidate_options(temp_class, preferred_mode)
 
     reason_lower = reason.lower()
@@ -184,6 +187,7 @@ def _select_route_rule_based(temp_class: str, preferred_mode: Optional[str], rea
 
 
 def _response_text(resp: Any) -> str:
+    """Extract plain text from an LLM response object, handling str, list, and attribute access."""
     content = getattr(resp, "content", resp)
     if isinstance(content, str):
         return content
@@ -199,6 +203,7 @@ def _response_text(resp: Any) -> str:
 
 
 def _extract_json(text: str) -> Dict[str, Any]:
+    """Parse JSON from LLM output, stripping markdown fences and falling back to brace extraction."""
     text = text.strip()
     fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
     if fenced:
@@ -224,6 +229,7 @@ def _select_route_llm(
     product_id: Optional[str],
     shipment_route: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
+    """Ask the active LLM to choose one route from the candidate list; returns None if LLM unavailable or parse fails."""
     llm = get_llm()
     if llm is None:
         return None
@@ -311,6 +317,7 @@ def _execute(
     product_id: Optional[str] = None,
     preferred_mode: Optional[str] = None,
 ) -> dict:
+    """LangChain tool entry point: resolve temp class, enrich from Supabase, select route via LLM or rules."""
     temp_class = _get_temp_class(product_id) if product_id else "refrigerated"
 
     shipment_route = _fetch_shipment_route(shipment_id)

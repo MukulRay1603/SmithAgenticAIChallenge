@@ -47,7 +47,7 @@ import logging
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 import pandas as pd
 from langchain_core.tools import StructuredTool

@@ -1006,6 +1006,33 @@ def analytics():
     }
 
 
+
+@app.get("/api/system/credits")
+def system_credits():
+    """Component attribution and team identification for this deployment."""
+    return {
+        "team": "Team Synapse",
+        "competition": "UMD Smith School of Business Agentic AI Challenge, April 2026",
+        "award": "$4,000 Winner",
+        "repository": "https://github.com/nsumesh/SmithAgenticAIChallenge",
+        "live_demo": "https://ai-cargo-monitor-prod.vercel.app",
+        "components": [
+            {"component": "Route agent · temp class taxonomy · LLM + rule hybrid", "owner": "Mukul Ray", "file": "tools/route_agent.py"},
+            {"component": "Triage agent · urgency ranking · enrichment", "owner": "Mukul Ray / Rahul Sharma", "file": "tools/triage_agent.py"},
+            {"component": "Triage API endpoints", "owner": "Mukul Ray", "file": "backend/app.py — /api/triage/*"},
+            {"component": "Insurance agent · cascade design · claim assembly", "owner": "Mukul Ray (design) · Nikhil Sumesh / Rahul Sharma (implementation)", "file": "tools/insurance_agent.py"},
+            {"component": "LLM provider fallback chain · 4-provider architecture", "owner": "Mukul Ray", "file": "orchestrator/llm_provider.py"},
+            {"component": "ML pipeline · XGBoost · SHAP · feature engineering", "owner": "Rahul Sharma", "file": "src/predictive_model.py, pipeline.py"},
+            {"component": "LangGraph orchestrator · plan/reflect/revise loop", "owner": "Rahul Sharma", "file": "orchestrator/"},
+            {"component": "Compliance agent · RAG pipeline · 417 regulatory chunks", "owner": "Yash", "file": "tools/compliance_agent.py"},
+            {"component": "Notification agent · email · Slack webhook", "owner": "Yash", "file": "tools/notification_agent.py"},
+            {"component": "Scheduling agent · feasibility checks · priority ranking", "owner": "Nikhil Sumesh", "file": "tools/scheduling_agent.py"},
+            {"component": "Cold storage agent · facility scoring · temp compatibility", "owner": "Nikhil Sumesh", "file": "tools/cold_storage_agent.py"},
+            {"component": "Data pipeline · Supabase schema · product/facility data", "owner": "Karthik", "file": "src/supabase_client.py, src/data_loader.py, data/"},
+        ],
+    }
+
+
 # ── Helpers ──────────────────────────────────────────────────────────
 
 def _build_shipment_summaries(

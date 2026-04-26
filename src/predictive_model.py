@@ -17,7 +17,6 @@ import pandas as pd
 import shap
 from sklearn.metrics import (
     average_precision_score,
-    classification_report,
     f1_score,
     precision_recall_curve,
     roc_auc_score,
