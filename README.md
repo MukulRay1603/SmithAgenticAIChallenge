@@ -1,425 +1,220 @@
-**Live Demo:** [https://ai-cargo-monitor-prod.vercel.app/](https://ai-cargo-monitor-prod.vercel.app/)
+# AI Cargo Monitor
 
-# AI Cargo Monitor -- Pharmaceutical Cold-Chain Risk Intelligence
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-ai--cargo--monitor-8B5CF6?style=flat-square&logo=vercel)](https://ai-cargo-monitor-prod.vercel.app)
+[![Winner](https://img.shields.io/badge/UMD%20Smith%20Agentic%20AI%20Challenge-$4%2C000%20Winner-gold?style=flat-square)](https://smith.umd.edu)
+[![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python)](https://python.org)
+[![LangGraph](https://img.shields.io/badge/LangGraph-Orchestration-1C3A5E?style=flat-square)](https://langchain.com/langgraph)
+[![React](https://img.shields.io/badge/React-Vite%20Dashboard-61DAFB?style=flat-square&logo=react)](https://react.dev)
 
-An end-to-end **agentic AI system** that monitors temperature-sensitive pharmaceutical
-shipments in real time, predicts spoilage risk with hybrid ML+rules scoring,
-orchestrates autonomous mitigation actions through 8 specialized agents, validates
-regulatory compliance via RAG-powered LLM interpretation, and maintains full
-FDA/GDP audit trails -- all powered by a LangGraph pipeline with a React dashboard.
+**AI Decision Intelligence for Pharmaceutical Cold Chain**
+
+> Monitoring tells you what happened. This system decides what to do.
+
+Pharmaceutical cold-chain failures cost **$35 billion annually**. The problem is not detection — sensors work. The problem is the gap between detection and intelligent action. A temperature excursion triggers an alert; a human reads it 47 minutes later, finds a QA manager, manually searches 417 regulatory documents, gets director approval, and finally contacts the hospital. By then the product is gone.
+
+AI Cargo Monitor closes that gap. It ingests real-time shipment telemetry, scores spoilage risk using a hybrid ML + deterministic engine, and autonomously orchestrates a cascade of operational decisions — rerouting, cold storage, appointment rescheduling, insurance claim drafting — in 12–15 seconds, with a human approval gate before any irreversible action fires.
 
 ---
 
-## Architecture Overview
+## Live System
 
+**→ [ai-cargo-monitor-prod.vercel.app](https://ai-cargo-monitor-prod.vercel.app)**
+
+Backend: Railway · Frontend: Vercel · Data: Supabase · LLM: Groq (primary)
+
+---
+
+## Architecture
+
+The system is five layers, each with a single responsibility:
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    SUPABASE  (Cloud Data Platform)                   │
-│   window_features │ product_profiles │ facilities │ product_costs   │
-│   compliance_knowledge (pgvector) │ compliance_docs (Storage)       │
-└──────────┬──────────────────────────────────────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│  LAYER 1: DATA PIPELINE                                              │
-│  supabase_client.py (paginated fetch + local fallback)               │
-│  stream_listener (embedded in FastAPI lifespan → auto-score+orch)    │
-└──────────┬───────────────────────────────────────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│  LAYER 2: RISK SCORING ENGINE                                        │
-│  ┌────────────────┐  ┌──────────────────┐  ┌─────────────────────┐  │
-│  │ Feature Eng.   │  │ Deterministic    │  │ XGBoost Predictor   │  │
-│  │ (14 features)  │  │ Rules (8 rules)  │  │ (Optuna + SHAP)     │  │
-│  └────────┬───────┘  └────────┬─────────┘  └──────────┬──────────┘  │
-│           └───────────────────┴──────────────┐        │             │
-│                                              ▼        │             │
-│                                    ┌──────────────────┤             │
-│                                    │   Risk Fusion    │◄────────────┘ │
-│                                    │  (0.4d + 0.6ml)  │              │
-│                                    └────────┬─────────┘              │
-└─────────────────────────────────────────────┼────────────────────────┘
-                                              │
-           ┌──────────────────────────────────┘
-           │  risk_input: {risk_tier, fused_score, ml_prob, rules, ...}
-           ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│  LAYER 3: CONTEXT ASSEMBLER                                          │
-│  delay_ratio, delay_class, hours_to_breach, facility, product_cost   │
-└──────────┬───────────────────────────────────────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│  LAYER 4: AGENTIC ORCHESTRATION  (LangGraph StateGraph)              │
-│                                                                      │
-│  Act-First, Always-Review HITL Pipeline:                             │
-│  interpret → plan(LLM)                                               │
-│    ├── LOW → output  (monitoring only)                               │
-│    └── MEDIUM+ → execute → observe(LLM) → reflect(LLM)              │
-│                    ├── adequate → human_review → output               │
-│                    └── gaps → revise(LLM) → human_review → output    │
-│                                                                      │
-│  Post-review: Confirm & Close | Execute Corrections                  │
-│                                                                      │
-│  ┌──────────┐ ┌──────────┐ ┌────────────┐ ┌────────────┐           │
-│  │compliance│ │cold_store│ │ notify     │ │ schedule   │           │
-│  │(RAG+LLM) │ │          │ │ (LLM+SMTP)│ │            │           │
-│  ├──────────┤ ├──────────┤ ├────────────┤ ├────────────┤           │
-│  │insurance │ │  route   │ │  triage    │ │  approval  │           │
-│  └──────────┘ └──────────┘ └────────────┘ └────────────┘           │
-└──────────┬───────────────────────────────────────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│  LAYER 5: BACKEND + DASHBOARD                                        │
-│  FastAPI (25 endpoints + WebSocket)                                  │
-│  React 19 + Vite + Tailwind v4 + Recharts + Mermaid                 │
-└──────────────────────────────────────────────────────────────────────┘
+│  Layer 1 · Data Pipeline                                            │
+│  IoT telemetry → Supabase (window_features) + local CSV fallback    │
+│  Real APIs: OpenSky flight delays · Open-Meteo ambient temperature  │
+├─────────────────────────────────────────────────────────────────────┤
+│  Layer 2 · Hybrid Risk Scoring                                      │
+│  8 deterministic rules + XGBoost (Optuna-tuned) + SHAP explainer    │
+│  Fused score → SAFE / WARN / HIGH / CRITICAL tier                   │
+├─────────────────────────────────────────────────────────────────────┤
+│  Layer 3 · Context Engineering                                      │
+│  delay_ratio · delay_class · hours_to_breach · facility enrichment  │
+│  Builds the risk_input contract for the orchestrator                │
+├─────────────────────────────────────────────────────────────────────┤
+│  Layer 4 · Agentic Orchestration                                    │
+│  LangGraph state machine: interpret → plan → execute →              │
+│  observe → reflect → revise → human gate → final output             │
+├─────────────────────────────────────────────────────────────────────┤
+│  Layer 5 · React Dashboard                                          │
+│  8 pages · WebSocket live updates · Human Review Queue              │
+│  Overview · Monitoring · Shipments · Agent Activity · Audit Log     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Quick Start
+## Risk Intelligence Engine
 
-```bash
-# 1. Clone and enter
-cd AI_cargo
+The core of the system is a hybrid scoring pipeline that fuses two independent signals:
 
-# 2. Create virtual environment
-python3 -m venv .venv && source .venv/bin/activate
+**Layer A — Deterministic rule engine (8 rules)**
 
-# 3. Install Python dependencies
-pip install -r requirements.txt
+| Rule | Trigger | Sub-score |
+|------|---------|-----------|
+| `temp_critical_breach` | Temperature outside critical bounds | 0.60 |
+| `temp_warning_breach` | Temperature outside safe bounds | 0.30 |
+| `temp_trend_warning` | Slope > 1°C/hr approaching boundary | up to 0.20 |
+| `excursion_duration` | Cumulative breach exceeds product limit | up to 0.30 |
+| `delay_temp_stress` | Delay > 120 min + temp near boundary | up to 0.25 |
+| `freeze_risk` | Below 0°C for freeze-sensitive products (WHO PQS E006) | 0.50 |
+| `battery_critical` | Battery below 15% | 0.15 |
+| `shock_event` | Any shock or door-open event | up to 0.15 |
 
-# 4. Configure environment
-cp .env.example .env   # then fill in your keys
-# Required:  SUPABASE_URL, SUPABASE_KEY
-# Required:  GROQ_API_KEY  (for agentic mode + RAG compliance)
-# Optional:  OPENAI_API_KEY, ANTHROPIC_API_KEY
+Rules fire instantly, are fully auditable, and cannot be overridden by the ML layer when `det_score ≥ 0.8` (deterministic veto).
 
-# 5. Train the risk model
-python3 pipeline.py train
+**Layer B — XGBoost predictive model**
 
-# 6. Start the backend
-python3 -m uvicorn backend.app:app --port 8000
+Trained on 7,411 scored telemetry windows across 6 product profiles and 6 facilities. Predicts spoilage risk 6 hours ahead. Hyperparameters tuned via 30-trial Optuna search (maximises PR-AUC). SHAP values explain every prediction — required for FDA 21 CFR Part 11 auditability.
 
-# 7. Start the dashboard
-cd dashboard && npm install && npm run dev
-
-# Dashboard → http://localhost:5173
-# API docs  → http://localhost:8000/docs
+**Fusion**
+```
+fused_score = 0.4 × det_score + 0.6 × ml_score
+— but if det_score ≥ 0.8:
+fused_score = max(det_score, blended)
 ```
 
-### LLM Configuration
-
-The system supports 4 LLM providers with automatic fallback:
-
-| Provider | Model | Speed | Env Vars |
-|----------|-------|-------|----------|
-| **Groq** (default) | `llama-3.3-70b-versatile` | ~1-2s | `GROQ_API_KEY` |
-| Ollama | `qwen2.5:7b` | ~5-10s | (local, auto-detected) |
-| OpenAI | `gpt-4o-mini` | ~2-3s | `OPENAI_API_KEY` |
-| Anthropic | `claude-3-5-haiku-latest` | ~2-3s | `ANTHROPIC_API_KEY` |
-
-```bash
-# Priority order (default)
-CARGO_LLM_PRIORITY="groq,ollama,openai,anthropic"
-
-# Disable LLM entirely (deterministic-only mode)
-CARGO_LLM_ENABLED=0
-
-# Hot-reconfigure at runtime (no restart needed)
-curl -X POST http://localhost:8000/api/llm/configure \
-  -H "Content-Type: application/json" \
-  -d '{"groq_api_key": "gsk_...", "priority": "groq,openai"}'
-```
+The deterministic layer can only raise the final score, never lower it below what the rules found. A missed spoilage costs millions; a false alert costs a phone call.
 
 ---
 
-## Project Structure
+## Agentic Orchestration Loop
 
+When `fused_score` crosses a tier threshold, the LangGraph orchestrator activates:
 ```
-AI_cargo/
-│
-├── pipeline.py                    LangGraph risk-scoring pipeline (train/score)
-├── system_prompt.md               Orchestrator agent system prompt
-├── requirements.txt               Python dependencies
-├── ARCHITECTURE.md                Detailed system architecture (I/O specs per tool)
-├── PROGRESS_REPORT.md             Task tracking & team distribution
-├── .env                           API keys and configuration
-│
-├── data/
-│   ├── single_table.csv           7,408 telemetry windows (local fallback)
-│   ├── product_profiles.json      WHO-aligned temperature thresholds
-│   ├── product_costs.json         Per-product cost/insurance data
-│   └── facilities.json            Cold-storage facility database
-│
-├── src/                           Risk scoring engine
-│   ├── data_loader.py             Supabase-first loader with local fallback
-│   ├── supabase_client.py         Centralized Supabase client (5 tables + write)
-│   ├── feature_engineering.py     14 derived features (rolling, lag, deviation)
-│   ├── deterministic_engine.py    8 product-aware rules → composite score
-│   ├── predictive_model.py        XGBoost + Optuna + SHAP explainability
-│   ├── risk_fusion.py             Weighted blend + deterministic veto + NaN handling
-│   ├── context_assembler.py       Enriches risk data with delay/breach/facility context
-│   └── compliance_logger.py       GDP/FDA JSONL audit records per window
-│
-├── orchestrator/                  Agentic orchestration (LangGraph)
-│   ├── state.py                   OrchestratorState TypedDict (shared graph state)
-│   ├── nodes.py                   Deterministic nodes + cascade enrichment
-│   ├── llm_nodes.py               Agentic LLM-powered plan + reflect nodes
-│   ├── llm_provider.py            Multi-provider LLM (Groq/Ollama/OpenAI/Anthropic)
-│   └── graph.py                   StateGraph construction + mode switching
-│
-├── tools/                         LangChain StructuredTools (8 agents)
-│   ├── compliance_agent.py        RAG compliance (pgvector + Groq LLM + audit log)
-│   ├── route_agent.py             LLM-assisted safe route selection from certified route options
-│   ├── cold_storage_agent.py      Facility lookup with suitability scoring
-│   ├── notification_agent.py      Multi-channel stakeholder alerts
-│   ├── scheduling_agent.py        Facility reschedule with financial impact
-│   ├── insurance_agent.py         Itemized claim preparation with loss breakdown
-│   ├── triage_agent.py            Multi-shipment urgency ranking with enrichment
-│   ├── approval_workflow.py       Human-in-the-loop approval queue
-│   ├── __init__.py                ALL_TOOLS list + TOOL_MAP registry
-│   └── helper/                    RAG compliance sub-modules
-│       ├── vector_store.py        Supabase pgvector + mock fallback
-│       ├── mock_vector_store.py   6 hardcoded FDA/ICH/WHO/GDP regulations
-│       ├── embeddings.py          SentenceTransformer (all-MiniLM-L6-v2)
-│       ├── llm_interpreter.py     Groq LLM for edge-case compliance
-│       ├── document_parser.py     PDF → chunked text (500 words, 50 overlap)
-│       ├── ingest_compliance_docs.py  Supabase Storage → vector store pipeline
-│       └── mocks.py               MockComplianceAgent for testing
-│
-├── streaming/                     Real-time data pipeline
-│   ├── stream_listener.py         Supabase Realtime → POST /api/ingest
-│   └── simulate_stream.py         CSV replay → Supabase for testing
-│
-├── backend/                       FastAPI REST + WebSocket API
-│   ├── app.py                     25 endpoints + WebSocket + LLM config
-│   └── models.py                  Pydantic schemas (risk engine ↔ orchestrator)
-│
-├── dashboard/                     React + Vite + Tailwind + Recharts
-│   └── src/components/
-│       ├── Overview.jsx           KPI cards, tier pie chart, risky shipments
-│       ├── Monitoring.jsx         Live risk feed, alert banners
-│       ├── ShipmentList.jsx       Filterable shipment table
-│       ├── ShipmentDetail.jsx     Temp + risk timelines, window table
-│       ├── AgentActivity.jsx      Orchestrator decisions, tool results, LLM reasoning
-│       ├── GraphView.jsx          Mermaid-rendered orchestration + system topology
-│       ├── AuditLog.jsx           Compliance records with SHAP features
-│       └── Approvals.jsx          Human approval queue (approve/reject)
-│
-├── artifacts/                     Generated outputs
-│   ├── xgb_spoilage.joblib       Trained XGBoost model
-│   └── scored_windows.csv        Full scored dataset
-│
-├── audit_logs/                    Compliance audit trail
-│   ├── audit_YYYYMMDD.jsonl      Per-window risk audit records
-│   └── compliance_events.jsonl   RAG compliance validation records
-│
-└── notebooks/
-    └── 01_eda_data_quality.ipynb  EDA & data quality report
+interpret risk
+↓
+plan (LLM or deterministic template)
+↓
+execute cascade (agents run sequentially, each inheriting prior results)
+↓
+observe (tool success/failure analysis)
+↓
+reflect (GAP / QUALITY notes on execution)
+↓
+revise (corrective steps if gaps found or tools deferred)
+↓
+◉ human review gate ← ALL MEDIUM+ pauses here
+↓
+notification fires (only after approval)
 ```
 
----
-
-## Hybrid Risk Scoring
-
-The system combines two independent scoring layers:
-
-**Deterministic rules** (instant, auditable, 8 product-aware rules):
-
-| Rule | Trigger | Score |
-|------|---------|-------|
-| `temp_critical_breach` | Outside critical limits | 0.60 |
-| `temp_warning_breach` | Outside normal limits | 0.30 |
-| `temp_trend` | Slope >1°C/hr toward breach | 0.20 |
-| `excursion_duration` | Cumulative min > product tolerance | 0.30 |
-| `battery_critical` | Battery < 20% | 0.15 |
-| `humidity_alert` | Humidity > threshold | 0.10 |
-| `delay_temp_stress` | Delay >120min + near breach | 0.25 |
-| `freeze_risk` | Freeze-sensitive + temp ≤0°C | 0.50 |
-
-**XGBoost predictor** (learned, probabilistic):
-- 14 engineered features (rolling stats, lag transforms, progress indicators)
-- Optuna-tuned hyperparameters (30 trials, PR-AUC objective)
-- SHAP values for every prediction (regulatory explainability)
-- Shipment-stratified train/val/test split (no temporal leakage)
-
-**Fusion**: `final = 0.4 × deterministic + 0.6 × ML`, with deterministic veto
-for critical breaches (det_score > 0.8 cannot be reduced by ML).
-NaN handling: missing score defaults to the available one; both NaN → 0.5 (MEDIUM).
-
-| Tier | Score Range | Action |
-|------|-------------|--------|
-| LOW | 0.0 -- 0.3 | Standard monitoring |
-| MEDIUM | 0.3 -- 0.6 | Increased frequency, pre-alert |
-| HIGH | 0.6 -- 0.8 | Active intervention, notify ops |
-| CRITICAL | 0.8 -- 1.0 | Immediate action, human approval |
+Every agent result becomes the next agent's context automatically — no independent lookups. The compliance `log_id` flows into the insurance claim. The cold storage facility name flows into the scheduling agent. The orchestrator accumulates a `cascade_context` dict that grows richer at every step.
 
 ---
 
-## Agentic Orchestration
+## Agent Roster
 
-The orchestration agent is a **LangGraph StateGraph** implementing a
-**plan-reflect-revise-execute** loop. In **agentic mode**, the LLM decides
-which tools to call AND constructs the tool input payloads -- it is not a
-template executor.
-
-```
-interpret → plan(LLM) → reflect(LLM) → [revise(LLM)] → approval_gate
-  MEDIUM:        → execute → observe(LLM) → [replan?] → output (automatic)
-  HIGH/CRITICAL: → output (plan-only, awaiting human approval)
-  After approval: execute approved tools → observe → output
-```
-
-### Orchestration Nodes
-
-| Node | Mode | What it does |
-|------|------|-------------|
-| **interpret** | Deterministic | Classifies severity, identifies primary issue from rule flags |
-| **plan** | **Agentic** (Groq LLM) | LLM analyzes risk, selects tools, constructs inputs with domain reasoning |
-| **plan** | Deterministic fallback | Tier-based templates with `_build_tool_input()` |
-| **reflect** | **Agentic** (Groq LLM) | LLM critiques plan against GDP/FDA compliance requirements |
-| **reflect** | Deterministic fallback | 5-point checklist |
-| **revise** | **Agentic** (Groq LLM) | LLM rewrites plan to fix all gaps, deduplicates tools |
-| **revise** | Deterministic fallback | Keyword scan on GAP notes, inserts missing tools |
-| **approval_gate** | Deterministic | Pauses pipeline for HIGH/CRITICAL; creates approval with proposed tools. MEDIUM auto-continues to execute |
-| **execute** | Deterministic | Result-aware cascade execution with dependency tracking (`failed_tools`, `_DEPENDS_ON` map) |
-| **observe** | **Agentic** (Groq LLM) | Inspects execution results, triggers re-plan for CRITICAL failures (max 1 loop) |
-| **fallback** | Deterministic | Minimal backup plan if execution had errors |
-| **output** | Deterministic | Assembles final JSON with LLM reasoning, observation, and re-plan count |
-
-### Cascade Enrichment
-
-During execution, each tool's output enriches inputs to downstream tools:
-
-| Source Tool | Feeds Into | What Flows |
-|-------------|-----------|------------|
-| `cold_storage_agent` | `notification_agent` | facility name, advance notice, temp range |
-| `cold_storage_agent` | `scheduling_agent` | facility, advance notice, temp range |
-| `compliance_agent` | `insurance_agent` | log_id as supporting evidence |
-| Product cost data | `insurance_agent` | estimated_loss_usd |
-| All tools | `approval_workflow` | consolidated action summaries |
-
-### Human-in-the-Loop Approval Flow
-
-The system implements a **plan-first** HITL pattern — tools only execute after human review:
-
-1. **Orchestration triggered** — LLM generates plan, reflects, revises (full agentic pipeline)
-2. **Approval gate** — HIGH/CRITICAL events pause here. The plan and proposed tools are stored.
-   MEDIUM events skip the gate and auto-execute.
-3. **Human reviews plan** — Dashboard shows the LLM's proposed tools and reasoning
-4. **Operator decides** — Approve (with optional tool selection) or reject
-5. **Post-approval execution** — `run_orchestrator_selective()` executes only the approved
-   tools. Tools run exactly once — never before approval.
-6. **Observe + Output** — LLM inspects results, history updated in-place via WebSocket
-
-### RAG Compliance Agent
-
-The compliance agent uses **Retrieval-Augmented Generation** for regulatory validation:
-
-1. **Audit log** -- immutable JSONL append (always succeeds, GDP-compliant)
-2. **Semantic search** -- query Supabase pgvector (`compliance_knowledge` table) using
-   sentence-transformer embeddings (`all-MiniLM-L6-v2`, 384 dimensions)
-3. **LLM interpretation** -- Groq `llama-3.3-70b-versatile` interprets retrieved
-   regulations against shipment context → compliance decision, violations, disposition
-4. **Fallback chain** -- mock regulations if vector store empty → deterministic
-   decision if LLM unavailable → audit-only if both fail
-
-### Agentic vs Deterministic Mode
-
-| Feature | Agentic | Deterministic |
-|---------|---------|---------------|
-| Plan generation | LLM reasons about situation | Tier templates |
-| Tool inputs | LLM constructs from risk data | `_build_tool_input()` |
-| Reflection | LLM compliance critique | Checklist matching |
-| Compliance | RAG search + LLM interpretation | Append-only audit log |
-| Latency | ~10-15s (Groq) | <1s |
-| Provider | Groq / Ollama / OpenAI / Anthropic | None needed |
-
----
-
-## Supabase Integration
-
-All data access goes through `src/supabase_client.py` with automatic local fallback:
-
-| Table | Rows | Used By | Fallback |
-|-------|------|---------|----------|
-| `window_features` | 7,411 | data_loader, ingest endpoint | `data/single_table.csv` |
-| `product_profiles` | 6 | deterministic engine, all agents | `data/product_profiles.json` |
-| `product_costs` | 6 | insurance, scheduling agents | `data/product_costs.json` |
-| `facilities` | 6 | cold_storage, insurance, scheduling | `data/facilities.json` |
-| `compliance_knowledge` | 417 | RAG compliance agent (pgvector) | regulations from documents |
-| `compliance_docs` | (Storage bucket) | PDF ingestion pipeline | (none) |
-
----
-
-## API Reference
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/risk/overview` | GET | Tier distribution, KPIs, top risky shipments |
-| `/api/shipments` | GET | All shipments, filterable by `risk_tier` |
-| `/api/shipments/{id}/windows` | GET | All windows for a shipment |
-| `/api/windows` | GET | Windows, filterable by tier/product, paginated |
-| `/api/windows/{window_id}` | GET | Single window detail |
-| `/api/risk/score-window/{id}` | GET | Risk engine output for orchestrator |
-| `/api/ingest` | POST | Real-time single-window scoring (from stream) |
-| `/api/orchestrator/run/{id}` | POST | Run orchestration agent on a window |
-| `/api/orchestrator/run-batch` | POST | Orchestrate multiple windows |
-| `/api/orchestrator/history` | GET | Recent orchestrator decisions |
-| `/api/orchestrator/mode` | GET | Current mode (agentic/deterministic) |
-| `/api/tools/{name}/execute` | POST | Execute any agent tool directly |
-| `/api/triage/critical-shipments` | GET | Auto-triage: pull worst shipments, rank |
-| `/api/triage/rank` | POST | Rank caller-supplied shipments |
-| `/api/graph/mermaid` | GET | Orchestrator graph as Mermaid string |
-| `/api/graph/topology` | GET | Full 5-layer system topology JSON |
-| `/api/audit-logs` | GET | Compliance audit records |
-| `/api/approvals/pending` | GET | Pending human approval requests |
-| `/api/approvals/all` | GET | All approvals (pending + approved + rejected) |
-| `/api/approvals/{id}/decide` | POST | Approve or reject an action |
-| `/api/approvals/{id}/execute` | POST | Execute approved plan (skips approval_workflow to prevent ghost approvals) |
-| `/api/orchestrator/history` | DELETE | Clear in-memory orchestration history |
-| `/api/llm/status` | GET | Active LLM provider, available providers |
-| `/api/llm/configure` | POST | Hot-configure API keys, priority, models |
-| `/ws/events` | WebSocket | Real-time event stream |
-
----
-
-## Data Quality Findings
-
-| Finding | Impact | Status |
-|---------|--------|--------|
-| `shock_count` 99.7% zeros | Low ML signal | Flagged for data gen update |
-| `door_open_count` 99.8% zeros | Low ML signal | Flagged for data gen update |
-| `minutes_outside_range > 0` implies target=1 | Leaky feature | Used in det only; lag-transformed for ML |
-| P03 zero spoilage events | Under-modeled | Add CRT excursion scenarios |
-| P06: 37.8% spoilage rate | Dominates positives | Handled via stratified split |
-| 17% class imbalance | ML bias | scale_pos_weight=4.9 in XGBoost |
-
-## Model Performance
-
-| Metric | Validation | Test |
-|--------|-----------|------|
-| PR-AUC | 0.9987 | 0.5822 |
-| ROC-AUC | 0.9997 | 0.9446 |
-| F1 | 0.9742 | 0.4118 |
+| Agent | Role | Type |
+|-------|------|------|
+| **Triage** | Ranks at-risk shipments by urgency before orchestration begins | Deterministic |
+| **Compliance** | RAG search across 417 regulatory chunks (WHO / EU GDP / FDA 21 CFR) | LLM + RAG |
+| **Cold Storage** | Scores backup facilities by temp compatibility, proximity, capacity | Deterministic |
+| **Route** | Selects alternative cold-chain route via rule table + LLM candidate selection | Hybrid |
+| **Scheduling** | Reschedules downstream appointments; ranks by patient urgency and disruption cost | Deterministic |
+| **Insurance** | Computes 4-component itemised loss; assembles claim package for director sign-off | Deterministic |
+| **Approval** | Human-in-the-loop gate; holds all MEDIUM+ actions pending operator decision | HITL |
+| **Notification** | Multi-channel stakeholder alerts (email / Slack / dashboard) post-approval | LLM-driven |
 
 ---
 
 ## Tech Stack
 
-| Layer | Technologies |
-|-------|-------------|
-| **Risk Engine** | Python, pandas, scikit-learn, XGBoost, SHAP, Optuna |
-| **Orchestration** | LangGraph, LangChain Core |
-| **LLM Providers** | Groq (llama-3.3-70b), Ollama (qwen2.5:7b), OpenAI, Anthropic |
-| **RAG Compliance** | Supabase pgvector, sentence-transformers, Groq LLM |
-| **Data Platform** | Supabase (PostgreSQL, Realtime, Storage) |
-| **Backend** | FastAPI, Pydantic, uvicorn |
-| **Frontend** | React 19, Vite, Tailwind CSS v4, Recharts, Mermaid |
-| **Compliance** | JSONL audit logs, SHAP explainability, human-in-the-loop |
+| Layer | Technology |
+|-------|------------|
+| Orchestration | LangGraph (StateGraph with typed state) |
+| LLM providers | Groq (primary) → OpenAI → Anthropic → Ollama (offline fallback) |
+| ML | XGBoost · Optuna · SHAP · scikit-learn |
+| Backend | FastAPI · Python 3.11 · WebSocket |
+| Database | Supabase (PostgreSQL + pgvector) |
+| RAG | ChromaDB / Supabase pgvector · Sentence Transformers |
+| Frontend | React 18 · Vite · Recharts |
+| Deployment | Railway (backend) · Vercel (frontend) |
+| External APIs | OpenSky Network (flight delays) · Open-Meteo (ambient temperature) |
 
+**LLM provider fallback chain** — the system never goes dark. If Groq is unavailable or rate-limited, it switches to OpenAI, then Anthropic, then Ollama running fully offline with no internet dependency. One environment variable controls priority order; zero redeployment required.
 
+---
+
+## Key Numbers
+
+| Metric | Value |
+|--------|-------|
+| Telemetry windows scored | 7,411 |
+| Product profiles | 6 |
+| Facilities modelled | 6 |
+| Regulatory chunks (RAG corpus) | 417 |
+| Deterministic risk rules | 8 |
+| Specialized agents | 8 |
+| API endpoints | 25+ |
+| LLM providers (fallback chain) | 4 |
+| Agentic response time | ~12–15 seconds |
+| Deterministic fallback response | < 1 second |
+| Dashboard pages | 8 |
+| E2E tests | 30+ |
+
+---
+
+## My Contributions
+
+*This fork is maintained by [Mukul Ray](https://github.com/MukulRay1603). Component-level attribution is in [CONTRIBUTORS.md](./CONTRIBUTORS.md). Below is what I designed and built.*
+
+**Route Agent** (`tools/route_agent.py`)
+
+Hybrid rule-based + LLM-assisted route selection for cold-chain shipments under risk. The agent classifies each product into a temperature class (frozen / refrigerated / CRT), looks up candidate routes from a curated route table, then optionally asks the active LLM to select the best candidate given real Supabase route context — actual origin, destination, carrier, weather condition, and delay probability. Falls back gracefully to deterministic rule selection on any LLM failure. `requires_approval` is always `True`; route changes are irreversible.
+
+**Triage Agent** (`tools/triage_agent.py`) + triage API endpoints
+
+Ranks multiple at-risk shipments by urgency before any orchestration decisions are made. Two-key sort: tier priority first (CRITICAL=0, HIGH=1, MEDIUM=2, LOW=3), then `fused_risk_score` descending within tier. Enriches each shipment from `scored_windows.csv` with `hours_at_risk`, `peak_temp_c`, and `primary_breach_rule`. The `recommended_orchestration_order` output (CRITICAL + HIGH only) is what the LangGraph planner uses when running batch orchestration. Also built the backend API endpoints: `GET /api/triage/critical-shipments` and `POST /api/triage/rank`.
+
+**Insurance Agent cascade design** (`tools/insurance_agent.py`)
+
+Designed the cascade position and integration contract: called after compliance and cold storage, receives the compliance `log_id` as `supporting_evidence` via `_enrich_tool_input`, creating a direct audit chain from regulatory decision to financial claim. The assembled package never fires automatically — it routes to the human approval gate by design.
+
+**LLM Provider Fallback Chain** (`orchestrator/llm_provider.py`)
+
+Designed the 4-provider hot-swap architecture: Groq → OpenAI → Anthropic → Ollama. Priority order is configurable via `CARGO_LLM_PRIORITY` environment variable with zero redeployment. Ollama enables full offline operation for clients requiring data sovereignty. The system degrades gracefully to deterministic-only mode if no provider is available, rather than failing.
+
+**Scalability & Containerisation architecture**
+
+Designed the deployment model: single Docker image, device-agnostic (sits above any existing Sensitech / Tive / Controlant tracker hardware without rip-and-replace), offline-resilient via local CSV/JSON fallback. Cost model: ~$200K one-time setup, ~$10K/month recurring. One prevented biologic loss ($215K average) covers 12 months of operation.
+
+**Bug fix: `_should_revise()` in orchestrator/graph.py**
+
+The original implementation unconditionally routed every orchestration run through the revise node, wasting one full LLM call per incident regardless of whether reflection found any issues. Fixed to check for GAP notes in reflection output and deferred tools before routing, making the logic explicit and eliminating unnecessary LLM spend on clean executions.
+
+---
+
+## Team Synapse
+
+| Member | Primary Components |
+|--------|--------------------|
+| Rahul Sharma | LangGraph orchestrator · ML pipeline · XGBoost · feature engineering |
+| Karthik | Data pipeline · Supabase schema · product and facility data |
+| Mukul Ray *(this fork)* | Route agent · Triage agent · Insurance cascade · LLM fallback chain · Scalability |
+| Yash | Compliance agent · RAG pipeline · Notification agent · Slack/email integration |
+| Nikhil Sumesh | Scheduling agent · Cold storage agent · Deployment · Railway/Vercel |
+
+---
+
+## Competition
+
+**UMD Smith School of Business · Agentic AI Challenge · April 2026**
+**1st Place — $4,000**
+
+Challenge: Design an agentic AI system capable of triggering cascading operational actions when pharmaceutical shipment risks are detected — balancing automation with regulatory constraints, explainability, and human-in-the-loop oversight.
+
+Original repository: [nsumesh/SmithAgenticAIChallenge](https://github.com/nsumesh/SmithAgenticAIChallenge)
+
+---
+
+*Monitoring tells you what happened. We built the system that decides what to do.*
